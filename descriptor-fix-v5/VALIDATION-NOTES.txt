@@ -1,0 +1,14 @@
+V5 validation notes (EXPERIMENTAL)
+
+Linux: resource_tracking_tests pass on V4 and V4B trees with V5-B applied
+(including TestUniformLoadDescriptorPhi).
+
+Windows: not yet run. After Actions artifact KytyPS5-Descriptor-Fix-V5-Windows-x64:
+1. Set KYTY_BDA_WRITES=1 (default ON in V4B/V5).
+2. Boot Ace Combat 8 PPSA24913.
+3. Success for this layer: no ResourceTracking EXIT on CS 0xe41c5e833516362b;
+   no descriptors.cpp "scalar resource reads overlap" EXIT; U16 load binds a
+   normal buffer (host Phi-lower) rather than IndirectBuffer/BDA.
+4. Send ace-combat-log-v5.txt + shader dump if it still dies.
+
+Do not enable Jetsku software RT for this test.

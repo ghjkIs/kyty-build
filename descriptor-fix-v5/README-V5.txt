@@ -1,15 +1,17 @@
-KytyPS5 descriptor fix V5 — RESEARCH STUB (EXPERIMENTAL)
+KytyPS5 descriptor fix V5 (V5-B) - EXPERIMENTAL
 
-Status: research only. No patch yet. Wait for V4B Ace Combat log on
-compute hash 0xe41c5e833516362b before implementing.
+Base: KytyPS5/KytyPS5 7b9997baea0d385e9e8fc2bd3abeb02110bc4148
+Recommended patch: descriptor-v5.patch (cumulative: V4B + V5-B)
+  sha256 6212fc121db62685ca327d14503ef6297de8b949315c89339062cccf3757f00b
+Alt: descriptor-v5.patch (V4 + V5-B, no BDA writes) was not pushed;
+     v5b-incremental.patch (V5-B only) available locally.
 
-Plan (see V5-RESEARCH.md):
-  V5-B (preferred): host-lower Phi for buffer loads (U16/U8/U32*),
-    with loop-invariant exception so Ace Combat's 3-loop shader can pass.
-  V5-A (fallback): broaden IndirectBuffer allow-list to U16/U8 only if
-    ResourceMaterialization / SPIR-V emit already support those loads.
+V5-A (IndirectBuffer U8/U16 loads) was already part of V4/V4B - nothing new there.
+V5-B: uniform, write-free descriptor Phis that feed raw buffer loads
+(LoadBufferU8/U16/U32/x2/x3/x4) are host-lowered to SelectU32 like V3 atomics,
+so they bind a normal buffer instead of a BDA IndirectBuffer read. Diamonds on
+a cycle are accepted when loop-invariant (inputs defined off the cycle, memory
+reads before any write). LaneId / loop-carried selections still fall back.
 
-Base: descriptor-fix-v4b (BDA writes + compute scalar/write overlap allow).
-Do NOT pull Jetsku software RT / Astro Bot path.
-
-Bot2 wrote V5-RESEARCH.md; Bot1 will implement after V4B results.
+Status: Linux resource_tracking_tests pass (V4 and V4B trees). No Windows build,
+no game booted. See V5-B-PATCH-PLAN.md. Run with KYTY_BDA_WRITES=1.
