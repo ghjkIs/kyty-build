@@ -5,15 +5,19 @@ Target: Ace Combat 8 (PPSA24913), compute shader hash 0x1d81bb2b74faf456
 This is a build kit, not a prebuilt EXE. GitHub Actions builds the EXE.
 
 HOW TO BUILD AND RUN
-1. In the kyty-build repo, the V3 workflow lives in
-   .github/workflows/build-windows-v3.yml (branch descriptor-fix-v3).
-   The V2 workflow (build-windows.yml) is left untouched for comparison.
-   GitHub only lists workflow_dispatch workflows that exist on the default
-   branch, so to see "Build KytyPS5 descriptor fix V3 for Windows" in the
-   Actions sidebar, merge descriptor-fix-v3 into main (or copy
-   build-windows-v3.yml into main). It can also be started from the API/CLI
-   with ref=descriptor-fix-v3 (gh workflow run build-windows-v3.yml --ref descriptor-fix-v3).
-2. Actions > Build KytyPS5 descriptor fix V3 for Windows > Run workflow.
+1. Branch descriptor-fix-v3 of kyty-build holds the V3 workflow twice:
+   .github/workflows/build-windows-v3.yml and, on this branch only,
+   .github/workflows/build-windows.yml (same V3 content). main still has the
+   V2 build-windows.yml, untouched, for comparison.
+   Why both: GitHub can only dispatch workflows whose file exists on the
+   default branch (main). build-windows-v3.yml is not on main yet, so it
+   cannot be started directly; build-windows.yml is registered, and
+   dispatching it with the branch selected runs the branch's (V3) contents.
+2. Actions > "Build KytyPS5 descriptor fix V2 for Windows" (the registered
+   name of build-windows.yml) > Run workflow > Branch: descriptor-fix-v3.
+   The run itself is titled "Build KytyPS5 descriptor fix V3 for Windows".
+   If you merge descriptor-fix-v3 into main later, build-windows-v3.yml shows
+   up as its own entry and build-windows.yml on main becomes V3 as well.
 3. When the run is green, download the artifact
    KytyPS5-Descriptor-Fix-V3-Windows-x64 (patched source is in
    KytyPS5-Descriptor-Fix-V3-Source).
