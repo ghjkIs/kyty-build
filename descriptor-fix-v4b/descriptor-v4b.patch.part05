@@ -1,0 +1,144 @@
++    Fixture fixture;
++    const auto handle = fixture.Buffer(
++        {fixture.Emit(ValueOpcode::LaneId), Value(0u), Value(64u), Value(0u)}, 0x84);
++    MemoryInfo memory;
++    memory.kind = ResourceKind::Buffer;
++    const auto operation = fixture.Emit(opcode,
++        {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
++        fixture.AddMemory(memory, 0x84));
++    if (operation.GetType() != Type::Void) fixture.Emit(ValueOpcode::Reference, {operation});
++    CheckFatal([&] { fixture.PlanAndTrack(); }, ValueOpcodeName(opcode),
++               "unsupported dynamic writes lost their opcode diagnostic");
++  }
++  MemoryInfo typed;
++  typed.typed = true;
++  Check(!typed.SupportsIndirectBufferLoad(ValueOpcode::LoadBufferU32),
++        "typed loads were enabled without a typed backend");
++}
++
++// Descriptor fix V4 Layer B: with KYTY_BDA_WRITES, raw stores and 32-bit atomics through a
++// GPU-computed V# (one Layer A cannot lower) become BDA writes in compute shaders.
++void TestBdaWritesThroughComputedDescriptor() {
++  struct Case {
++    ValueOpcode opcode;
++    uint32_t dwords;
++  };
++  const std::array cases{Case{ValueOpcode::StoreBufferU32, 1u},
++                         Case{ValueOpcode::StoreBufferU32x4, 4u},
++                         Case{ValueOpcode::BufferAtomicIAdd32, 1u},
++                         Case{ValueOpcode::BufferAtomicISub32, 1u},
++                         Case{ValueOpcode::BufferAtomicOr32, 1u},
++                         Case{ValueOpcode::BufferAtomicCmpSwap32, 1u}};
++  const auto build = [](Fixture &fixture, ValueOpcode opcode, uint32_t dwords, bool formatted) {
++    fixture.program.shader_hash = 0xe41c5e833516362bull;
++    const auto handle = fixture.Buffer(
++        {fixture.Emit(ValueOpcode::LaneId), Value(0u), Value(64u), Value(0u)}, 0x84);
++    MemoryInfo memory;
++    memory.kind = ResourceKind::Buffer;
++    memory.data_dwords = dwords;
++    memory.formatted = formatted;
++    Value data = Value(1u);
++    if (dwords == 4u) {
++      data = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
++                          {Value(1u), Value(2u), Value(3u), Value(4u)});
++    }
++    const auto memory_index = fixture.AddMemory(memory, 0x84);
++    const auto operation =
++        opcode == ValueOpcode::BufferAtomicCmpSwap32
++            ? fixture.Emit(opcode, {handle, Value(0u), Value(0u), Value(0u), data, Value(7u),
++                                    Value(true)},
++                           memory_index)
++            : fixture.Emit(opcode, {handle, Value(0u), Value(0u), Value(0u), data, Value(true)},
++                           memory_index);
++    if (operation.GetType() != Type::Void) fixture.Emit(ValueOpcode::ReferenceU32, {operation});
++  };
++  BdaWritesOverride() = BdaWritesMode::On;
++  for (const auto &test : cases) {
++    Fixture fixture;
++    build(fixture, test.opcode, test.dwords, false);
++    fixture.PlanAndTrack();
++    Check(fixture.program.memory_info[0].kind == ResourceKind::IndirectBuffer,
++          "Layer B did not turn a computed-V# write into a BDA write");
++    Check(fixture.program.info.bda_writes && fixture.program.info.uses_dma &&
++              fixture.program.info.buffers.empty(),
++          "Layer B BDA write did not set bda_writes/uses_dma or bound a static buffer");
++    Check(!fixture.program.has_address_writes,
++          "Layer B BDA write must not disable compute scalar specialization");
++    ShaderComputeInputInfo compute{};
++    CollectShaderInfo(fixture.program, {.compute = &compute});
++    Check(fixture.program.info.subgroup_local_invocation_id,
++          "Layer B BDA write lost the lane id needed by ADD_TID addressing");
++    ValidateProgram(fixture.program, false);
++  }
++  {
++    // Formatted (typed-conversion) stores keep the upstream diagnostic.
++    Fixture fixture;
++    build(fixture, ValueOpcode::StoreBufferU32, 1u, true);
++    CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
++               "Layer B accepted a formatted store through a computed V#");
++  }
++  {
++    // Only compute shaders get BDA writes.
++    Fixture fixture(ShaderType::Pixel);
++    build(fixture, ValueOpcode::StoreBufferU32, 1u, false);
++    CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
++               "Layer B accepted a pixel-shader write through a computed V#");
++  }
++  BdaWritesOverride() = BdaWritesMode::Off;
++  {
++    Fixture fixture;
++    build(fixture, ValueOpcode::BufferAtomicOr32, 1u, false);
++    CheckFatal([&] { fixture.PlanAndTrack(); }, "BufferAtomicOr32",
++               "KYTY_BDA_WRITES=0 did not restore the upstream error");
++  }
++  MemoryInfo raw;
++  raw.data_bits = 32u;
++  Check(raw.SupportsIndirectRawWrite(ValueOpcode::StoreBufferU32) &&
++            !raw.SupportsIndirectRawWrite(ValueOpcode::BufferAtomicOr64) &&
++            !raw.SupportsIndirectRawWrite(ValueOpcode::LoadBufferU32),
++        "SupportsIndirectRawWrite accepted 64-bit atomics or loads");
++  raw.data_bits = 8u;
++  Check(raw.SupportsIndirectRawWrite(ValueOpcode::StoreBufferU8) &&
++            !raw.SupportsIndirectRawWrite(ValueOpcode::StoreBufferU32),
++        "SupportsIndirectRawWrite byte width mismatch");
++}
++
+ } // namespace
+
+ int main() {
+@@ -3550,6 +4178,9 @@ int main() {
+         throw std::runtime_error(std::string(name) + ": " + exception.what());
+       }
+     };
++    // Upstream/V2-V4 expectations run with Layer B off; Layer B has its own test below.
++    BdaWritesOverride() = BdaWritesMode::Off;
++    Run("expanded indirect reads", TestExpandedIndirectBufferReads);
+     Run("dense buffers", TestDenseBufferTracking);
+     Run("compute buffer fill", TestComputeBufferFill);
+     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+@@ -3569,6 +4200,8 @@ int main() {
+     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
+     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
+     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
++    Run("terminal store descriptor phi", TestTerminalStoreDescriptorPhi);
++    Run("uniform atomic descriptor phi", TestUniformAtomicDescriptorPhi);
+     Run("writable descriptor phi", TestWritableDescriptorPhi);
+     Run("conditional sampler phi", TestConditionalSamplerPhi);
+     Run("finite image phi cycle", TestFiniteImagePhiCycle);
+@@ -3582,13 +4215,16 @@ int main() {
+     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
+     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
+     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
++    Run("written scalar-branch buffer", TestWrittenScalarBranchBuffer);
+     Run("conservative buffer reachability", TestConservativeBufferReachability);
++    Run("writable buffer phi", TestWritableBufferPhi);
+     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
+     Run("shader info collection", TestShaderInfoCollection);
+     Run("image binding ABI", TestImageBindingAbi);
+     Run("live shader data collection", TestLiveShaderDataCollection);
+     Run("resource limit", TestResourceLimitIsTransactional);
+     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
++    Run("V4B BDA writes through computed V#", TestBdaWritesThroughComputedDescriptor);
+   } catch (const std::exception &exception) {
+     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
+     return 1;
