@@ -1,0 +1,49 @@
+V4B validation notes
+====================
+
+Done (Linux, GCC, no GPU):
+* descriptor-v4b.patch applies with "git apply --check" and "git apply" on a clean 7b9997b
+  checkout, and "git diff --check" is clean. The workflow's verify step (SHA pin + apply)
+  was executed locally against that checkout and passed.
+* resource_tracking_tests (same sources as the CMake target): all tests pass, including the
+  new "V4B BDA writes through computed V#" test. Existing tests run with
+  KYTY_BDA_WRITES forced Off, so the upstream/Layer A diagnostics are still covered.
+  New test checks:
+    - StoreBufferU32, StoreBufferU32x4, BufferAtomicIAdd32/ISub32/Or32/CmpSwap32 through a
+      LaneId-computed V# (hash 0xe41c5e833516362b) become IndirectBuffer with bda_writes and
+      uses_dma, bind no static buffer, and leave has_address_writes false.
+    - CollectShaderInfo keeps subgroup_local_invocation_id, and ValidateProgram passes.
+    - Formatted stores, pixel-stage writes, and KYTY_BDA_WRITES=0 keep the upstream fatal
+      diagnostic.
+    - SupportsIndirectRawWrite rejects 64-bit atomics, loads, and width mismatches.
+* SPIR-V: spirv-bda-harness.cpp builds the IR above (plus StoreBufferU32x2/U8/U16) and
+  runs Spirv::EmitProgram. All 8 modules pass "spirv-val --target-env vulkan1.3", with and
+  without KYTY_BDA_STORE_LOG=1. Disassembly shows OpConvertUToPtr to PhysicalStorageBuffer,
+  OpStore Aligned 4 / OpAtomic*, and the OpAtomicOr page marking.
+* The written-page compaction shader (fault_buffer_process.comp with
+  MAX_PAGE_FAULTS=65536) compiles with glslangValidator and passes spirv-val.
+* faultManager/bufferCache/renderCompute/descriptors/SPIR-V emitter files were
+  syntax-checked with GCC. The only errors were pre-existing upstream GCC/Vulkan-hpp
+  ambiguities on unchanged lines. The full MSVC/clang-cl build runs in CI.
+
+NOT done:
+* No GPU execution, no Vulkan validation layers, no game boot.
+* No performance measurement.
+
+Risks:
+* Synchronous settle: every dispatch with BDA writes submits and waits for the GPU
+  (CommandScheduler Wait). This is correct but can be slow if such a shader runs often.
+* Intra-dispatch semantics: scalar reads in the same dispatch see pre-dispatch values
+  (snapshot). That matches non-coherent scalar-cache behaviour, but a shader that relies on
+  reading its own vector stores through scalar loads in the same dispatch would differ.
+* BDA writes to pages that are not mapped in the BDA page table are dropped (counted only
+  with KYTY_BDA_STORE_LOG / verify).
+* At most 65536 written pages (1 GiB) per dispatch are settled. Overflow is logged (fatal in
+  verify) and the extra pages are not GPU-dirty marked.
+* With BDA writes on, the fault buffer grows from about 12.6 MB to about 25 MB
+  (bitmap x2 + 256 B tail).
+* Excluded: formatted/typed stores, 64-bit atomics, non-compute stages. A 16-bit store at
+  byte offset 3 (crossing a dword) is truncated to the first dword.
+* Overlap allow applies to all single-stage compute pipelines while KYTY_BDA_WRITES is on,
+  not only BDA-writing ones (needed for 0xe41c, which uses a bound buffer write). Each
+  bypass is logged once per shader hash.
