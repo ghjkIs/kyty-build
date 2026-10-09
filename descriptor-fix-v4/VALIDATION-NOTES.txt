@@ -1,0 +1,60 @@
+KytyPS5 descriptor fix V4 (Layer A) - validation notes
+
+Patch: descriptor-v4.patch (cumulative vs 7b9997baea0d385e9e8fc2bd3abeb02110bc4148)
+SHA256: 68c673346c67a1ab1bee46b4db89f0f663b1fccf571aadbc5a2735e4c253f4f2
+Contains V3 (descriptor-v3.patch, sha bbc01f37...) unchanged except where
+ResourceTracking.cpp / ResourceTrackingTests.cpp were extended for #1224.
+Files: spirvEmitterMemory.cpp, Program.cpp, ShaderIR.h (V2, unchanged),
+       SrtWalker.h/.cpp (#1224), ResourceTracking.cpp (V2+V3+#1224),
+       tests/ResourceTrackingTests.cpp (V2+V3+#1224+V4).
+
+DONE HERE (Linux, GCC 14.2, C++20, standalone build of the
+resource_tracking_tests source list from CMakeLists.txt)
+- V3 patch applied cleanly to a fresh 7b9997b worktree; V4 edits on top;
+  cumulative diff taken from that tree.
+- descriptor-v4.patch: git apply --check, git apply, patch -R --dry-run and
+  git diff --check succeed on a fresh 7b9997b worktree; resulting tree is
+  byte-identical to the tested tree.
+- The workflow reads the patch from the kit checkout
+  (descriptor-fix-v4/descriptor-v4.patch) and pins its SHA256 instead of
+  embedding it. Its Python apply step was executed locally against a fresh
+  worktree with that layout; SHA check and git apply succeeded.
+- resource_tracking_tests: "resource tracking tests passed" (whole suite,
+  including V2, V3 and the ported #1224 tests).
+- resource_materialization_tests (SrtWalker change): all cases passed.
+
+TESTS
+- terminal store descriptor phi (V2, adjusted): modes 0/2/4 now accepted with
+  user-data predicate (2 = write before diamond, 4 = read after store) and
+  evaluate correctly for both directions; LaneId (1) and loop (3) rejected;
+  memory predicate + 2/4 rejected; memory predicate + sole terminal store
+  accepted (V2 rule).
+- uniform atomic descriptor phi (V3, extended): BufferAtomicOr32/IAdd32
+  positive; (a) user-data predicate + write before -> accept (#1224 rule);
+  (b) memory predicate, no prior write -> accept (V3 rule); (c) memory
+  predicate + prior write -> reject; (d) (Phi+0x10)|0x40000 and Phi<<4
+  expressions accepted via both rules and evaluated correctly for both
+  branches; LaneId, loop back-edge and write-free loop around diamond rejected;
+  GPU SSA unchanged; one shared atomic binding; no IndirectBuffer fallback.
+- written scalar-branch buffer (#1224 GTA V CS d03361dd03166145, ported to the
+  7b9997b Block::terminator API): user-data predicate accepted; memory
+  predicate without prior write accepted (V3 rule, deviation from #1224 which
+  rejects it); memory predicate after a store rejected.
+- writable buffer phi (#1224 CS 42cd6fdf7ea2c764): user-data predicate
+  accepted and materialized correctly (flags 0/1/0x80000000), also with an
+  extra S_LSHL on the low word; memory predicate with two stores (not terminal,
+  not atomic) rejected.
+Mutation checks (each makes the suite fail): removing the #1224 predicate
+rule; removing the loop check on that rule; removing the ReadsMemory check;
+using LowerDescriptorPhi instead of LowerDescriptorWord; restricting the V3
+atomic scan to bare Phis.
+
+NOT DONE HERE
+- No local Windows/MSVC/clang-cl build (GitHub Actions does it and runs the
+  resource_tracking ctest).
+- No GPU run, SPIR-V execution, Ace Combat 8 or Astro Bot run. Real-game
+  behaviour is unverified.
+- Layer B (BDA writes), Layer C, Jetsku RT and skip-instead-of-exit are not
+  included.
+- Whole-shader-recompiler test targets other than resource tracking /
+  materialization were not built locally.
