@@ -1,0 +1,272 @@
+name: Build KytyPS5 descriptor fix V3 for Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out the exact official revision
+        uses: actions/checkout@v4
+        with:
+          repository: KytyPS5/KytyPS5
+          ref: 7b9997baea0d385e9e8fc2bd3abeb02110bc4148
+          path: source
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify and apply the bundled experimental patch
+        shell: python
+        run: |
+          import base64, hashlib, pathlib, subprocess, zlib
+          # Base64 of the zlib-compressed descriptor-v3.patch; SHA256 below is of the uncompressed patch.
+          encoded = """
+          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
+          Vd3f00vaR+j3Bt9A5/8LAR4m7g==
+          """
+          patch = zlib.decompress(base64.b64decode(encoded))
+          assert hashlib.sha256(patch).hexdigest() == "bbc01f37ce41f4a7c7f1e811ba769a987375402406d3aa07cbaae5d62f45e4bf", "Patch checksum mismatch"
+          path = pathlib.Path("descriptor-v3.patch").resolve()
+          path.write_bytes(patch)
+          subprocess.run(["git", "-C", "source", "apply", "--check", str(path)], check=True)
+          subprocess.run(["git", "-C", "source", "apply", str(path)], check=True)
+          subprocess.run(["git", "-C", "source", "diff", "--check"], check=True)
+
+      - name: Set up Visual Studio x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vcpkgRoot = Split-Path (Get-Command vcpkg -ErrorAction Stop).Source
+          & vcpkg install 'glslang[tools,opt]:x64-windows'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure the patched source
+        shell: cmd
+        run: >-
+          cmake -S source -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          -DKYTY_BUILD_ORIGIN=Source
+
+      - name: Compile the launcher, emulator, and regression tests
+        shell: cmd
+        run: cmake --build build --target launcher kyty_emulator resource_tracking_tests --parallel 4
+
+      - name: Run resource-tracking regression tests
+        shell: cmd
+        run: ctest --test-dir build -R "^resource_tracking$" --output-on-failure
+
+      - name: Stage a runnable Windows installation
+        shell: cmd
+        run: cmake --install build --prefix install
+
+      - name: Verify executables and attach provenance
+        shell: python
+        run: |
+          import pathlib, shutil, subprocess, zipfile
+          install = pathlib.Path("install")
+          for filename in ("launcher.exe", "kyty_emulator.exe"):
+              assert (install / filename).is_file(), f"Missing {filename}"
+          shutil.copy2("descriptor-v3.patch", install / "descriptor-v3.patch")
+          shutil.copy2("source/LICENSE", install / "LICENSE")
+          shutil.copytree("source/LICENSES", install / "LICENSES", dirs_exist_ok=True)
+          (install / "BUILD-INFO.txt").write_text(
+              "KytyPS5 descriptor fix V3 - EXPERIMENTAL.\n"
+              "Includes V2 (indirect buffer reads, terminal StoreBufferU32 descriptor Phi).\n"
+              "V3 adds host-side Select lowering for multi-use uniform descriptor Phis used by BufferAtomic*\n"
+              "(e.g. Ace Combat 8 PPSA24913 CS 0x1d81bb2b74faf456, 4x BufferAtomicOr32).\n"
+              "Ace Combat 8 compatibility is UNVERIFIED; no game/GPU run was performed when preparing this patch.\n"
+              "Upstream: https://github.com/KytyPS5/KytyPS5\n"
+              "Base: 7b9997baea0d385e9e8fc2bd3abeb02110bc4148\n"
+              "Patch SHA256: bbc01f37ce41f4a7c7f1e811ba769a987375402406d3aa07cbaae5d62f45e4bf\n"
+              "Resource-tracking tests passed in this build.\n", encoding="utf-8")
+          (install / "Run-PPSA24913-Diagnostic.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V3" --printf-direction File --printf-output-file "ace-combat-detail-v3.txt" > "ace-combat-log-v3.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          # Include the modified tracked source and the pinned submodule list for review.
+          entries = subprocess.check_output(["git", "-C", "source", "ls-files", "--stage", "-z"]).decode().split("\0")
+          with zipfile.ZipFile("patched-source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+              for entry in entries:
+                  if not entry:
+                      continue
+                  meta, name = entry.split("\t", 1)
+                  if meta.startswith("160000 "):
+                      continue
+                  archive.write(pathlib.Path("source") / name, name)
+              refs = subprocess.check_output(["git", "-C", "source", "submodule", "status", "--recursive"])
+              archive.writestr("PINNED-SUBMODULES.txt", refs)
+              archive.write("descriptor-v3.patch", "descriptor-v3.patch")
+
+      - name: Downloadable Windows executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Descriptor-Fix-V3-Windows-x64
+          path: install/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Downloadable modified source
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Descriptor-Fix-V3-Source
+          path: patched-source.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Test diagnostics if the build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-V3-Build-Diagnostics
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 14
