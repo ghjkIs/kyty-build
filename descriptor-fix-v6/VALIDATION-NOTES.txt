@@ -1,0 +1,16 @@
+V6 validation checklist (run Run-PPSA24913-Diagnostic-V6.cmd from the artifact)
+
+Success:
+- A "ShaderRecompiler CS phase ... hash=0x57f3b48d4975aff3 ... SPIR-V EmitProgram" line, then a
+  "QueuePoint DispatchDirect ... cs=..." after it.
+- "Shaders: VS/PS/CS" counters keep climbing past "VS 2 | PS 1 | CS 39".
+
+If it still dies, send:
+- The full "--- Guest fault context ---" block. "(host thread)" + pc 0x14... = Kyty host code, not guest.
+- The last ~300 lines of ace-combat-detail-v6.txt, plus lines matching:
+  descriptors: V4B allowing|BdaSettle|BDA writes enabled|using buffer device address|
+  shader resource tracking|overlap|ErrorDeviceLost|Shaders: VS
+- Ignore "Unresolved import stub called" (Usbd / NpCppWebApi) unless a crash follows on the SAME guest thread.
+
+Next walls to expect (V6-NEXT-WALLS.md): W1 e41c BDA reads returning 0 (#1138/#925),
+W2 uncovered GPU-selected op (64-bit atomics / formatted stores), W3 graphics overlap EXITs.

@@ -1,0 +1,186 @@
+diff --git a/src/graphics/host_gpu/rangeSet.h b/src/graphics/host_gpu/rangeSet.h
+index ab475d5585..97b84ff0d5 100644
+--- a/src/graphics/host_gpu/rangeSet.h
++++ b/src/graphics/host_gpu/rangeSet.h
+@@ -65,6 +65,23 @@ class RangeSet final {
+ 		return it != m_ranges.end() && it->first < end;
+ 	}
+ 
++	// The range holding all of [address, address + size), as [begin, last).
++	[[nodiscard]] bool FindContaining(uint64_t address, uint64_t size, uint64_t& begin,
++	                                  uint64_t& last) const {
++		const auto end = End(address, size);
++		auto       it  = m_ranges.upper_bound(address);
++		if (it == m_ranges.begin()) {
++			return false;
++		}
++		--it;
++		if (it->first > address || it->second < end) {
++			return false;
++		}
++		begin = it->first;
++		last  = it->second;
++		return true;
++	}
++
+ 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
+ 		const auto end = End(address, size);
+ 		auto       it  = m_ranges.upper_bound(address);
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index 38bcc3aaca..d3f1a0c12f 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -103,11 +103,53 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
+ 	Log::WriteToConsoleAndLog(message);
+ }
+ 
++// Resource tables can hold a stale or null pointer that the shader only follows on paths the
++// game never takes. Words the guest has not mapped for the GPU read as zero (a null descriptor)
++// instead of failing, or faulting on the host. A read that crosses the end of a mapping keeps
++// its mapped words.
++template <typename ReadMapped>
++bool ReadShaderMemory(uint64_t address, std::span<uint32_t> values, ReadMapped&& read_mapped) {
++	using Libs::LibKernel::Memory::IsGpuMapped;
++	if (values.empty()) {
++		return false;
++	}
++	if (IsGpuMapped(address, values.size_bytes())) {
++		return read_mapped(address, values);
++	}
++	const auto word_mapped = [&](size_t index) {
++		return IsGpuMapped(address + index * sizeof(uint32_t), sizeof(uint32_t));
++	};
++	for (size_t begin = 0; begin < values.size();) {
++		const bool mapped = word_mapped(begin);
++		size_t     end    = begin + 1;
++		while (end < values.size() && word_mapped(end) == mapped) {
++			++end;
++		}
++		const auto segment = values.subspan(begin, end - begin);
++		if (!mapped) {
++			std::ranges::fill(segment, 0u);
++		} else if (!read_mapped(address + begin * sizeof(uint32_t), segment)) {
++			return false;
++		}
++		begin = end;
++	}
++	return true;
++}
++
+ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+ 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
+ 	// Image synchronization belongs to formatted buffer bindings, not these reads.
+-	return !values.empty() &&
+-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
++	return ReadShaderMemory(address, values, [](uint64_t mapped, std::span<uint32_t> words) {
++		return Libs::LibKernel::Memory::TryReadBufferBacking(mapped, words.data(),
++		                                                     words.size_bytes());
++	});
++}
++
++bool ReadShaderOrdinaryMemory(void*, uint64_t address, std::span<uint32_t> values) {
++	return ReadShaderMemory(address, values, [](uint64_t mapped, std::span<uint32_t> words) {
++		std::memcpy(words.data(), reinterpret_cast<const void*>(mapped), words.size_bytes());
++		return true;
++	});
+ }
+ 
+ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
+@@ -302,6 +344,7 @@ struct PipelineCache::ProgramCache {
+ 		ShaderRecompiler::IR::SrtRuntime             runtime {
+ 		    .user_data                  = user_data,
+ 		    .shader_base                = params.Base(),
++		    .read_memory                = ReadShaderOrdinaryMemory,
+ 		    .read_specialization_memory = ReadShaderGuestMemory,
+ 		};
+ 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+diff --git a/src/graphics/host_gpu/renderer/renderContext.cpp b/src/graphics/host_gpu/renderer/renderContext.cpp
+index 431a56f4b4..7850531fb5 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.cpp
++++ b/src/graphics/host_gpu/renderer/renderContext.cpp
+@@ -83,8 +83,27 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
+ 	if (!GuestRange {vaddr, size}.Valid()) {
+ 		return false;
+ 	}
++	// Shader resource evaluation asks about many small reads inside the same mapping.
++	struct Cached {
++		const RenderContext* owner      = nullptr;
++		uint64_t             begin      = 0;
++		uint64_t             end        = 0;
++		uint64_t             generation = 0;
++	};
++	thread_local Cached cached;
++	if (cached.owner == this && vaddr >= cached.begin && vaddr < cached.end &&
++	    size <= cached.end - vaddr &&
++	    cached.generation == m_unmap_generation.load(std::memory_order_acquire)) {
++		return true;
++	}
+ 	std::shared_lock lock(m_mapped_ranges_mutex);
+-	return m_mapped_ranges.Contains(vaddr, size);
++	uint64_t         begin = 0;
++	uint64_t         end   = 0;
++	if (!m_mapped_ranges.FindContaining(vaddr, size, begin, end)) {
++		return false;
++	}
++	cached = {this, begin, end, m_unmap_generation.load(std::memory_order_relaxed)};
++	return true;
+ }
+ 
+ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+@@ -113,6 +132,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+ 		m_texture_cache.UnmapMemory(vaddr, size);
+ 		std::lock_guard lock(m_mapped_ranges_mutex);
+ 		m_mapped_ranges.Subtract(vaddr, size);
++		m_unmap_generation.fetch_add(1, std::memory_order_release);
+ 	};
+ 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
+ 	// longer accepts external work. Use the guest GPU's state for the teardown route.
+diff --git a/src/graphics/host_gpu/renderer/renderContext.h b/src/graphics/host_gpu/renderer/renderContext.h
+index e264213f5d..a335730a52 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.h
++++ b/src/graphics/host_gpu/renderer/renderContext.h
+@@ -15,6 +15,7 @@
+ #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+ #include "kernel/eventQueue.h"
+ 
++#include <atomic>
+ #include <memory>
+ #include <shared_mutex>
+ #include <vector>
+@@ -78,6 +79,8 @@ class RenderContext {
+ 	TextureCache              m_texture_cache;
+ 	mutable std::shared_mutex m_mapped_ranges_mutex;
+ 	RangeSet                  m_mapped_ranges;
++	// Advances on every unmap, so a range found mapped stays mapped while it is unchanged.
++	std::atomic<uint64_t>     m_unmap_generation = 0;
+ 	std::unique_ptr<GuestGpu> m_gpu;
+ 	VideoOut::VideoOutDriver* m_video_out = nullptr;
+ 	bool                      m_fault_process_pending = false;
+diff --git a/src/kernel/memory.cpp b/src/kernel/memory.cpp
+index 87a9bf948e..888911f2fc 100644
+--- a/src/kernel/memory.cpp
++++ b/src/kernel/memory.cpp
+@@ -889,6 +889,10 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+ 	return TryReadBacking(vaddr, data, size);
+ }
+ 
++bool IsGpuMapped(uint64_t vaddr, uint64_t size) noexcept {
++	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
++}
++
+ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+ 	EXIT_IF(g_virtual_ranges == nullptr);
+ 
+diff --git a/src/kernel/memory.h b/src/kernel/memory.h
+index 4b82e41b69..1468c8fe5e 100644
+--- a/src/kernel/memory.h
++++ b/src/kernel/memory.h
+@@ -115,6 +115,8 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
+ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
++// Whether the guest mapped [vaddr, vaddr + size) for GPU access.
++[[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size) noexcept;
+ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+ [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
