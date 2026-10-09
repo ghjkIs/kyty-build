@@ -1,1 +1,746 @@
-PLACEHOLDER
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c8f7700..e257040 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -294,7 +294,22 @@ add_custom_command(
+ 	DEPENDS "${fault_buffer_shader_source}"
+ 	VERBATIM
+ )
++# Descriptor fix V4 Layer B: the same compaction shader with room for 65536 written pages.
++set(bda_write_shader_spv "${gpu_tiler_generated_dir}/bda_write_process.spv")
++set(bda_write_shader_header "${gpu_tiler_generated_dir}/bda_write_process_spv.h")
++add_custom_command(
++	OUTPUT "${bda_write_shader_header}"
++	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
++	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
++	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=65536
++	        -o "${bda_write_shader_spv}" "${fault_buffer_shader_source}"
++	COMMAND ${CMAKE_COMMAND} -DINPUT=${bda_write_shader_spv} -DOUTPUT=${bda_write_shader_header}
++	        -DSYMBOL=BDA_WRITE_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
++	DEPENDS "${fault_buffer_shader_source}"
++	VERBATIM
++)
+ list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
++list(APPEND kyty_emulator_src "${bda_write_shader_header}")
+ list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
+ 
+ set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index 165e32e..1d3ad41 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -673,6 +673,28 @@ void BufferCache::ProcessFaultBuffer() {
+ 	m_fault_manager.ProcessFaultBuffer();
+ }
+ 
++void BufferCache::MarkBdaWritten(uint64_t vaddr, uint64_t size) {
++	// A BDA write can only reach bytes that a cache buffer backs through the page table. The
++	// buffer already holds the written bytes, so mark them GPU-dirty (a later CPU access or
++	// specialization read downloads them) and invalidate images over the same memory, as the
++	// bound writable-buffer path does when it binds.
++	const auto end = vaddr + size;
++	auto       it  = m_buffers.upper_bound(vaddr);
++	if (it != m_buffers.begin()) {
++		--it;
++	}
++	for (; it != m_buffers.end() && it->first < end; ++it) {
++		const auto& buffer = m_slot_buffers[it->second];
++		const auto  start  = std::max(buffer.CpuAddress(), vaddr);
++		const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
++		if (start < finish) {
++			m_memory_tracker.MarkRegionAsGpuModified(start, finish - start);
++			m_gpu_modified_ranges.Add(start, finish - start);
++			m_texture_cache.InvalidateMemoryFromGPU(start, finish - start);
++		}
++	}
++}
++
+ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+ 	const auto end = vaddr + size;
+ 	auto       it  = m_buffers.upper_bound(vaddr);
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index 1212bd5..361c1db 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -80,6 +80,12 @@ public:
+ 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+ 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+ 	void               ProcessFaultBuffer();
++	// Descriptor fix V4 Layer B (KYTY_BDA_WRITES).
++	[[nodiscard]] bool BdaWritesEnabled() const noexcept { return m_fault_manager.BdaWritesEnabled(); }
++	void               PrepareBdaWrites() { m_fault_manager.PrepareBdaWrites(); }
++	void               SettleBdaWrites(uint64_t shader_hash) { m_fault_manager.SettleBdaWrites(shader_hash); }
++	// Marks bytes of cache buffers in [vaddr, vaddr + size) as written by the GPU through BDA.
++	void               MarkBdaWritten(uint64_t vaddr, uint64_t size);
+ 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+ 	void               RunGarbageCollector();
+ 
+diff --git a/src/graphics/host_gpu/renderer/cache/faultManager.cpp b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+index 6720cec..05a97c4 100644
+--- a/src/graphics/host_gpu/renderer/cache/faultManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+@@ -2,16 +2,20 @@
+ 
+ #include "common/assert.h"
+ #include "common/logging/log.h"
++#include "gpu_tiler_shaders/bda_write_process_spv.h"
+ #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
+ #include "graphics/host_gpu/graphicContext.h"
+ #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+ #include "graphics/host_gpu/renderer/commandScheduler.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
++#include "graphics/shader/recompiler/ir/BdaWrites.h"
+ 
+ #include <bit>
++#include <fmt/format.h>
+ #include <cinttypes>
+ #include <cstring>
+ #include <limits>
++#include <unordered_set>
+ 
+ namespace Libs::Graphics {
+ 
+@@ -20,15 +24,31 @@ namespace {
+ constexpr size_t MaxPageFaults    = 1024;
+ constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
+ 
++// Layer B: must match -DMAX_PAGE_FAULTS of bda_write_process (CMakeLists.txt).
++constexpr size_t   MaxBdaWrittenPages = 65536;
++constexpr uint64_t FaultBitmapBytes   = BufferCache::CACHING_NUMPAGES / 8;
++constexpr uint64_t BdaTailBytes = ShaderRecompiler::IR::BdaFaultLayout::TailWords * sizeof(uint32_t);
++constexpr uint64_t BdaDownloadTail    = MaxBdaWrittenPages * sizeof(uint64_t);
++constexpr uint64_t BdaDownloadSize    = BdaDownloadTail + 256;
++static_assert(FaultBitmapBytes % 256 == 0);
++
++uint64_t FaultBufferSize() {
++	return ShaderRecompiler::IR::BdaWritesEnabled() ? 2 * FaultBitmapBytes + BdaTailBytes
++	                                                : FaultBitmapBytes;
++}
++
+ } // namespace
+ 
+ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
+                            BufferCache& buffer_cache)
+     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
+       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+-                     BufferCache::CACHING_NUMPAGES / 8),
++                     FaultBufferSize()),
+       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
+-                        MaxPendingFaults * PageFaultAreaSize) {
++                        MaxPendingFaults * PageFaultAreaSize),
++      m_bda_writes(ShaderRecompiler::IR::BdaWritesEnabled()),
++      m_bda_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
++                            m_bda_writes ? BdaDownloadSize : 256) {
+ 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
+ 
+ 	const vk::DescriptorSetLayoutBinding bindings[] {
+@@ -66,9 +86,29 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
+ 	m_graphics.device.destroyShaderModule(module, nullptr);
+ 	RequireVulkanSuccess(result, "create fault-buffer pipeline");
+ 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
++
++	if (m_bda_writes) {
++		const auto bda_module = CompileSPV(BDA_WRITE_PROCESS_SPV, m_graphics.device);
++		pipeline_info.stage.module = bda_module;
++		const auto bda_result = m_graphics.device.createComputePipelines(
++		    nullptr, 1, &pipeline_info, nullptr, &m_bda_settle_pipeline);
++		m_graphics.device.destroyShaderModule(bda_module, nullptr);
++		RequireVulkanSuccess(bda_result, "create BDA written-page pipeline");
++		SetVulkanObjectNameF(m_graphics.device, m_bda_settle_pipeline, "BDA Written Page Parser");
++		Log::WriteToConsoleAndLog(
++		    fmt::format("GPU: V4B BDA writes enabled (KYTY_BDA_WRITES{}): compute stores/atomics "
++		                "through GPU-computed V#s write through BDA and are settled after each "
++		                "dispatch; store log {}\n",
++		                ShaderRecompiler::IR::BdaWritesVerify() ? "=verify" : "=1",
++		                ShaderRecompiler::IR::BdaStoreLogEnabled() ? "on" : "off")
++		        .c_str());
++	}
+ }
+ 
+ FaultManager::~FaultManager() {
++	if (m_bda_settle_pipeline) {
++		m_graphics.device.destroyPipeline(m_bda_settle_pipeline, nullptr);
++	}
+ 	m_graphics.device.destroyPipeline(m_fault_process_pipeline, nullptr);
+ 	m_graphics.device.destroyPipelineLayout(m_fault_process_pipeline_layout, nullptr);
+ 	m_graphics.device.destroyDescriptorSetLayout(m_fault_process_desc_layout, nullptr);
+@@ -149,4 +189,140 @@ void FaultManager::ProcessFaultBuffer() {
+ 	m_current_area %= MaxPendingFaults;
+ }
+ 
++void FaultManager::PrepareBdaWrites() {
++	EXIT_IF(!m_bda_writes);
++	if (m_bda_cleared) {
++		return;
++	}
++	// Device-local memory starts undefined: clear the written-page bitmap and the tail once.
++	m_scheduler.EndRendering();
++	auto command = m_scheduler.Current().Handle();
++	command.fillBuffer(m_fault_buffer.Handle(), FaultBitmapBytes, FaultBitmapBytes + BdaTailBytes, 0);
++	vk::BufferMemoryBarrier barrier {};
++	barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
++	barrier.dstAccessMask       = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
++	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.buffer              = m_fault_buffer.Handle();
++	barrier.offset              = FaultBitmapBytes;
++	barrier.size                = FaultBitmapBytes + BdaTailBytes;
++	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
++	                        vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 1, &barrier,
++	                        0, nullptr);
++	m_bda_cleared = true;
++}
++
++void FaultManager::SettleBdaWrites(uint64_t shader_hash) {
++	EXIT_IF(!m_bda_writes || !m_bda_cleared);
++	const bool store_log = ShaderRecompiler::IR::BdaStoreLogEnabled();
++	auto*      mapped    = m_bda_download_buffer.Mapped().data();
++	std::memset(mapped, 0, sizeof(uint64_t));
++	std::memset(mapped + BdaDownloadTail, 0, 2 * sizeof(uint32_t));
++	m_bda_download_buffer.Flush(0, sizeof(uint64_t));
++	m_bda_download_buffer.Flush(BdaDownloadTail, 2 * sizeof(uint32_t));
++
++	m_scheduler.EndRendering();
++	auto command = m_scheduler.Current().Handle();
++	vk::MemoryBarrier pre {};
++	pre.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eHostWrite;
++	pre.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
++	                    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
++	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eHost,
++	                        vk::PipelineStageFlagBits::eComputeShader |
++	                            vk::PipelineStageFlagBits::eTransfer,
++	                        {}, 1, &pre, 0, nullptr, 0, nullptr);
++	const vk::DescriptorBufferInfo infos[] {
++	    {m_fault_buffer.Handle(), FaultBitmapBytes, FaultBitmapBytes},
++	    {m_bda_download_buffer.Handle(), 0, BdaDownloadTail},
++	};
++	std::array<vk::WriteDescriptorSet, 2> writes {};
++	for (uint32_t index = 0; index < writes.size(); ++index) {
++		writes[index].dstBinding      = index;
++		writes[index].descriptorCount = 1;
++		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
++		writes[index].pBufferInfo     = &infos[index];
++	}
++	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_bda_settle_pipeline);
++	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline_layout, 0,
++	                             writes);
++	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
++	const auto num_workgroups = (num_threads + 63) / 64;
++	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
++	if (store_log) {
++		const vk::BufferCopy copy {2 * FaultBitmapBytes, BdaDownloadTail, 2 * sizeof(uint32_t)};
++		command.copyBuffer(m_fault_buffer.Handle(), m_bda_download_buffer.Handle(), 1, &copy);
++	}
++	vk::MemoryBarrier clear_barrier {};
++	clear_barrier.srcAccessMask = vk::AccessFlagBits::eTransferRead;
++	clear_barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
++	if (store_log) {
++		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
++		                        vk::PipelineStageFlagBits::eTransfer, {}, 1, &clear_barrier, 0,
++		                        nullptr, 0, nullptr);
++		command.fillBuffer(m_fault_buffer.Handle(), 2 * FaultBitmapBytes, 2 * sizeof(uint32_t), 0);
++	}
++	vk::MemoryBarrier post {};
++	post.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
++	post.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eShaderRead |
++	                     vk::AccessFlagBits::eShaderWrite;
++	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader |
++	                            vk::PipelineStageFlagBits::eTransfer,
++	                        vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eAllCommands,
++	                        {}, 1, &post, 0, nullptr, 0, nullptr);
++
++	// Synchronous settle: the written pages must be GPU-dirty before anything (the CPU or the
++	// next dispatch's specialization reads) can look at them.
++	m_scheduler.Wait(m_scheduler.CurrentTick());
++	m_bda_download_buffer.Invalidate(0, BdaDownloadSize);
++
++	const auto* pages = std::bit_cast<const uint64_t*>(mapped);
++	const auto  found = static_cast<uint32_t>(pages[0]);
++	const auto  count = std::min<uint32_t>(found, MaxBdaWrittenPages - 1);
++	RangeSet    written;
++	for (uint32_t index = 1; index <= count; ++index) {
++		written.Add(BufferCache::GuestAddress(pages[index]), BufferCache::CACHING_PAGESIZE);
++	}
++	written.ForEach([this](uint64_t start, uint64_t end) {
++		m_buffer_cache.MarkBdaWritten(start, end - start);
++	});
++	m_bda_settles++;
++	m_bda_pages += count;
++
++	static std::unordered_set<uint64_t> logged;
++	const bool first = logged.insert(shader_hash).second;
++	if (first) {
++		Log::WriteToConsoleAndLog(
++		    fmt::format("GPU: V4B BdaSettle shader=0x{:016x} written_pages={} (settles={} pages={})\n",
++		                shader_hash, count, m_bda_settles, m_bda_pages)
++		        .c_str());
++	}
++	if (found >= MaxBdaWrittenPages) {
++		Log::WriteToConsoleAndLog(
++		    fmt::format("GPU: V4B BdaSettle overflow shader=0x{:016x}: {} written pages, only {} "
++		                "settled; later CPU reads of the rest may be stale\n",
++		                shader_hash, found, count)
++		        .c_str());
++		if (ShaderRecompiler::IR::BdaWritesVerify()) {
++			EXIT("BDA write settle overflow (KYTY_BDA_WRITES=verify)\n");
++		}
++	}
++	if (store_log) {
++		const auto* tail    = std::bit_cast<const uint32_t*>(mapped + BdaDownloadTail);
++		const auto  dropped = tail[ShaderRecompiler::IR::BdaFaultLayout::DroppedCountWord];
++		const auto  page    = tail[ShaderRecompiler::IR::BdaFaultLayout::DroppedPageWord];
++		if (dropped != 0) {
++			Log::WriteToConsoleAndLog(
++			    fmt::format("GPU: V4B BdaDroppedWrites shader=0x{:016x} count={} last_page=0x{:016x} "
++			                "(page had no cache buffer; it faults in for later dispatches)\n",
++			                shader_hash, dropped,
++			                page == 0 ? 0 : BufferCache::GuestAddress(uint64_t {page - 1}
++			                                                          << BufferCache::CACHING_PAGEBITS))
++			        .c_str());
++			if (ShaderRecompiler::IR::BdaWritesVerify()) {
++				EXIT("BDA writes dropped (KYTY_BDA_WRITES=verify)\n");
++			}
++		}
++	}
++}
++
+ } // namespace Libs::Graphics
+diff --git a/src/graphics/host_gpu/renderer/cache/faultManager.h b/src/graphics/host_gpu/renderer/cache/faultManager.h
+index 86dde24..22cb032 100644
+--- a/src/graphics/host_gpu/renderer/cache/faultManager.h
++++ b/src/graphics/host_gpu/renderer/cache/faultManager.h
+@@ -21,6 +21,12 @@ public:
+ 
+ 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
+ 	void                  ProcessFaultBuffer();
++	// Descriptor fix V4 Layer B (KYTY_BDA_WRITES): the fault buffer gains a written-page bitmap.
++	// PrepareBdaWrites runs before a BDA-writing dispatch; SettleBdaWrites runs right after it,
++	// waits for the GPU, and hands every written 16 KiB page to the buffer cache.
++	[[nodiscard]] bool    BdaWritesEnabled() const noexcept { return m_bda_writes; }
++	void                  PrepareBdaWrites();
++	void                  SettleBdaWrites(uint64_t shader_hash);
+ 
+ private:
+ 	GraphicContext&                            m_graphics;
+@@ -33,6 +39,12 @@ private:
+ 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
+ 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
+ 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;
++	bool                                       m_bda_writes                    = false;
++	bool                                       m_bda_cleared                   = false;
++	Buffer                                     m_bda_download_buffer;
++	vk::Pipeline                               m_bda_settle_pipeline           = nullptr;
++	uint64_t                                   m_bda_settles                   = 0;
++	uint64_t                                   m_bda_pages                     = 0;
+ };
+ 
+ } // namespace Libs::Graphics
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index d5e8124..31f89de 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -25,6 +25,7 @@
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
++#include "graphics/shader/recompiler/ir/BdaWrites.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+ #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+ #include "graphics/shader/shader.h"
+@@ -35,7 +36,9 @@
+ #include <bit>
+ #include <fmt/format.h>
+ #include <limits>
++#include <mutex>
+ #include <span>
++#include <unordered_set>
+ #include <vector>
+ 
+ #ifdef min
+@@ -51,6 +54,37 @@ namespace {
+ 
+ using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+ 
++// Descriptor fix V4 Layer B. A compute dispatch is a single stage: the renderer captures its
++// scalar/SRT specialization reads from guest memory immediately before the dispatch (through
++// TryReadBufferBacking, which first pulls back GPU-dirty bytes), so the dispatch observes the
++// values its scalar loads had when it started. That is a valid outcome on hardware too, where
++// S_LOAD/S_BUFFER_LOAD go through the scalar cache, which is not coherent with the same
++// dispatch's vector stores. The overlapping buffer write is a bound, GPU-dirty-tracked write
++// (or a Layer B BDA write that is settled after the dispatch), so the NEXT dispatch reads the
++// written bytes again before it specializes. Ace Combat 8 CS 0xe41c5e833516362b updates its own
++// descriptor/state table with BUFFER_STORE at the end of the shader and hit this check.
++// Graphics pipelines (several stages, attachments) and image writes keep the upstream EXIT.
++bool AllowComputeSnapshotOverlap(const ShaderRecompiler::IR::CompiledShaderInfo& program,
++                                 size_t stage_count, uint64_t read_address, uint64_t read_size,
++                                 uint64_t write_address, uint64_t write_size, const char* site) {
++	if (stage_count != 1u || program.stage != ShaderType::Compute ||
++	    !ShaderRecompiler::IR::BdaWritesEnabled()) {
++		return false;
++	}
++	static std::mutex                   mutex;
++	static std::unordered_set<uint64_t> logged;
++	std::scoped_lock                    lock(mutex);
++	if (logged.insert(program.shader_hash).second) {
++		Log::WriteToConsoleAndLog(fmt::format(
++		    "descriptors: V4B allowing compute scalar-read/buffer-write overlap ({}): shader=0x{:016x} "
++		    "read=[0x{:x},+0x{:x}) write=[0x{:x},+0x{:x}) bda_writes={}; reads were captured before the "
++		    "dispatch and the write is GPU-dirty tracked (KYTY_BDA_WRITES=0 restores the EXIT)\n",
++		    site, program.shader_hash, read_address, read_size, write_address, write_size,
++		    program.info.bda_writes ? 1 : 0).c_str());
++	}
++	return true;
++}
++
+ } // namespace
+ 
+ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
+@@ -835,7 +869,11 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+ 							if (read_size == 0) continue;
+ 							if (read_address > address) {
+ 								size = std::min(size, read_address - address);
+-							} else if (address - read_address < read_size) {
++							} else if (address - read_address < read_size &&
++							           !AllowComputeSnapshotOverlap(*reader->runtime->program,
++							                                        stages.size(), read_address,
++							                                        read_size, address, size,
++							                                        "sentinel range")) {
+ 								EXIT("scalar resource reads overlap a shader buffer write\n");
+ 							}
+ 						}
+@@ -1010,6 +1048,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+ 			if (writer->runtime->program->has_address_writes) {
+ 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+ 			}
++			// Layer B BDA writes have no host-visible range before the dispatch; the same
++			// compute snapshot argument applies and the written pages are settled afterwards.
++			if (writer->runtime->program->info.bda_writes &&
++			    !AllowComputeSnapshotOverlap(*writer->runtime->program, prepared_bindings.size(),
++			                                 reads.front().first, reads.front().second, 0, 0,
++			                                 "BDA writes")) {
++				EXIT("scalar resource reads cannot be proven disjoint from shader BDA writes\n");
++			}
+ 		}
+ 		for (const auto [address, size]: reads) {
+ 			for (const auto id: m_bound_images) {
+@@ -1029,8 +1075,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+ 				for (const auto& resource: program.info.buffers) {
+ 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+ 					const auto& written = writer->buffer_sources[resource.descriptor_index];
+-					if (written.size != 0 && ImageRangeOverlaps(address, size,
+-					                                          written.address, written.size)) {
++					if (written.size != 0 &&
++					    ImageRangeOverlaps(address, size, written.address, written.size) &&
++					    !AllowComputeSnapshotOverlap(*reader->runtime->program,
++					                                 prepared_bindings.size(), address, size,
++					                                 written.address, written.size,
++					                                 "bound buffer")) {
+ 						EXIT("scalar resource reads overlap a shader buffer write\n");
+ 					}
+ 				}
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index bddb6d5..de3e2d5 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -346,6 +346,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	if (program.info.uses_dma) {
+ 		m_context.PrepareBda();
+ 	}
++	EXIT_IF(program.info.bda_writes && !program.info.uses_dma);
++	if (program.info.bda_writes) {
++		m_context.GetBufferCache().PrepareBdaWrites();
++	}
+ 	RebindImages(bindings);
+ 	BindSharedMemory(m_context, input_info, bindings);
+ 	RebindBuffers(bindings);
+@@ -354,7 +358,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+ 	               std::span {&descriptor_stage, 1u});
+ 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
+-	    HasShaderBufferWrites(input_info.stage);
++	    HasShaderBufferWrites(input_info.stage) || program.info.bda_writes;
+ 	has_storage_writes =
+ 	    std::any_of(program.info.images.begin(), program.info.images.end(),
+ 	                [](const auto& image) {
+@@ -434,6 +438,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	// The removed host fence also ordered read-only dispatches before later writers.
+ 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+ 	ResetBindings();
++	if (program.info.bda_writes) {
++		// Layer B: synchronous settle of the pages written through BDA.
++		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
++	}
+ }
+ 
+ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+@@ -462,6 +470,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	if (program.info.uses_dma) {
+ 		m_context.PrepareBda();
+ 	}
++	EXIT_IF(program.info.bda_writes && !program.info.uses_dma);
++	if (program.info.bda_writes) {
++		m_context.GetBufferCache().PrepareBdaWrites();
++	}
+ 	BindSharedMemory(m_context, input_info, bindings, args_addr);
+ 	RebindImages(bindings);
+ 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
+@@ -473,7 +485,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	               std::span {&descriptor_stage, 1u});
+ 	const auto vk_buffer = buffer.Handle();
+ 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
+-	    HasShaderBufferWrites(input_info.stage) ||
++	    HasShaderBufferWrites(input_info.stage) || program.info.bda_writes ||
+ 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+ 		    return image.written && image.resource_class ==
+ 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
+@@ -493,6 +505,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+ 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+ 	ResetBindings();
++	if (program.info.bda_writes) {
++		// Layer B: synchronous settle of the pages written through BDA.
++		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
++	}
+ }
+ 
+ } // namespace Libs::Graphics
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+index 9198f77..7ad67b7 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+@@ -42,7 +42,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
+ 	const auto indirect_buffer_handle = [&](const IR::Inst& handle) {
+ 		return program.info.uses_dma && handle.NumArgs() == 4u && !handle.Uses().empty() &&
+ 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
+-			       if (IR::BufferAccessOf(use.user->GetOpcode()) != IR::BufferAccess::Read) {
++			       const auto access = IR::BufferAccessOf(use.user->GetOpcode());
++			       if (access == IR::BufferAccess::None ||
++			           (access != IR::BufferAccess::Read && !program.info.bda_writes)) {
+ 				       return false;
+ 			       }
+ 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+index d596c63..e49335f 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+ #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
++#include "graphics/shader/recompiler/ir/BdaWrites.h"
+ 
+ #include <algorithm>
+ #include <bit>
+@@ -595,9 +596,18 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem)
+ 	});
+ }
+ 
++// Layer B: a 32-bit buffer atomic through a GPU-computed V# (defined after PrepareIndirectBuffer).
++template <typename Fn>
++uint32_t EmitIndirectAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst, Fn&& operation);
++
+ template <typename Fn>
+ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
+                           const IR::MemoryInfo& mem, Fn&& operation) {
++	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
++		return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
++			return EmitIndirectAtomicAccess(ctx, inst, operation);
++		});
++	}
+ 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+ 		const auto index = DwordIndex(ctx, inst, mem);
+ 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+@@ -910,7 +920,7 @@ IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst
+ 	    .stride           = stride,
+ 	    .swizzle          = swizzle,
+ 	    .format           = field(word3, 12, 7),
+-	    .selector         = ctx.Memory(inst).formatted ? field(word3, 0, 3) : 0u,
++	    .selector         = ctx.Memory(inst).formatted ? field(word3, 0, 12) : 0u,
+ 	    .mode             = field(word3, 28, 2),
+ 	    .records          = records,
+ 	    .index_in_bounds  = Binary(state, spv::OpULessThan, TypeBool(state), index, records),
+@@ -976,10 +986,13 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
+ 	return ConstructU32Composite(state, components, values);
+ }
+ 
+-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
++uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, const IR::Inst& inst,
++                                        uint32_t output_component) {
+ 	auto& state = ctx.state;
+ 	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+ 		const auto buffer = PrepareIndirectBuffer(ctx, inst);
++		const auto selector = EmitBitFieldUExtract(state, buffer.selector,
++		    ConstantU32(state, output_component * 3u), ConstantU32(state, 3u));
+ 		return EmitIndexSwitch(
+ 		    state, buffer.format, static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u,
+ 		    TypeU32(state), [&](uint32_t format) {
+@@ -987,10 +1000,10 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
+ 			    if (info.type == Format::ComponentType::Unknown) return ConstantU32(state, 0);
+ 			    const auto constant = Select(
+ 			        state, TypeU32(state),
+-			        Binary(state, spv::OpIEqual, TypeBool(state), buffer.selector, ConstantU32(state, 1)),
++			        Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1)),
+ 			        FormattedConstant(ctx, info, FormattedSourceKind::One), ConstantU32(state, 0));
+ 			    return EmitValueOrDefaultIfCondition(
+-			        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
++			        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
+ 			                      ConstantU32(state, 4)),
+ 			        TypeU32(state), constant, [&]() {
+ 				        const auto in_bounds = IndirectBufferInBounds(state, buffer, 0u, info.byte_size, true);
+@@ -1013,7 +1026,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
+ 				        if (info.component_count == 1u) return emit_component(0u);
+ 				        const auto component = Binary(
+ 				            state, spv::OpUMod, TypeU32(state),
+-				            Binary(state, spv::OpISub, TypeU32(state), buffer.selector, ConstantU32(state, 4)),
++				            Binary(state, spv::OpISub, TypeU32(state), selector, ConstantU32(state, 4)),
+ 				            ConstantU32(state, info.component_count));
+ 				        return EmitIndexSwitch(state, component, info.component_count, TypeU32(state),
+ 				                               emit_component);
+@@ -1022,6 +1035,198 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
+ 	});
+ }
+ 
++uint32_t LoadIndirectFormattedBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
++                                      uint32_t components) {
++	std::array<uint32_t, 4> values {};
++	for (uint32_t component = 0; component < components; ++component)
++		values[component] = LoadIndirectFormattedComponent(ctx, inst, component);
++	return ConstructU32Composite(ctx.state, components, values);
++}
++
++uint32_t LoadIndirectSubwordBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
++	auto& state = ctx.state;
++	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
++		const auto buffer = PrepareIndirectBuffer(ctx, inst);
++		const auto bits = ctx.Memory(inst).data_bits;
++		const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
++		                                 ConstantU32(state, 0));
++		return LoadBda(ctx, buffer.address,
++		    AndCondition(state, valid_format,
++		                 IndirectBufferInBounds(state, buffer, 0u, bits / 8u, false)),
++		    bits, ctx.Memory(inst).coherent);
++	});
++}
++
++// ---- Descriptor fix V4 Layer B: BDA writes through GPU-computed V#s (KYTY_BDA_WRITES) ----
++// Hand port of the Jetsku dbe6e32d idea onto upstream's BDA page table and fault buffer:
++// - every write goes through the BDA page table to a PhysicalStorageBuffer pointer;
++// - the written page is recorded in a second bitmap that follows the fault bitmap, and the
++//   renderer settles those pages (marks them GPU-dirty) right after the dispatch;
++// - a page without a cache buffer drops the write and records a normal BDA fault, so a later
++//   dispatch finds a buffer; KYTY_BDA_STORE_LOG counts such drops.
++// Range checks follow the BDA loads: stores per DWORD, atomics all-or-nothing (0 when out of
++// range); a DWORD address ignores its low two bits; bytes/shorts replace their bits of the
++// containing DWORD atomically.
++constexpr uint32_t BdaWrittenBitmapWord =
++    static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32u);
++constexpr uint32_t BdaTailWord = 2u * BdaWrittenBitmapWord;
++
++uint32_t BdaPageIndex(EmitterState& state, uint32_t address) {
++	const auto type     = TypeU64(state);
++	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
++	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
++	const auto packed   = Select(
++	    state, type, extended,
++	    Binary(state, spv::OpISub, type, address,
++	           ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
++	    address);
++	return Unary(state, spv::OpUConvert, TypeU32(state),
++	             Binary(state, spv::OpShiftRightLogical, type, packed,
++	                    ConstantU32(state, BufferCache::CACHING_PAGEBITS)));
++}
++
++void MarkBdaWrittenPage(EmitterState& state, uint32_t address) {
++	const auto page = BdaPageIndex(state, address);
++	const auto word = Binary(state, spv::OpIAdd, TypeU32(state),
++	                         Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,
++	                                ConstantU32(state, 5)),
++	                         ConstantU32(state, BdaWrittenBitmapWord));
++	const auto bit =
++	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
++	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
++	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
++	                          FaultElementPointer(state, word), ConstantU32(state, spv::ScopeDevice),
++	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
++}
++
++void RecordDroppedBdaWrite(EmitterState& state, uint32_t address) {
++	if (!IR::BdaStoreLogEnabled()) return;
++	const auto page = BdaPageIndex(state, address);
++	state.builder.AddFunction(
++	    spv::OpAtomicIAdd, TypeU32(state), state.builder.AllocateId(),
++	    FaultElementPointer(state,
++	                        ConstantU32(state, BdaTailWord + IR::BdaFaultLayout::DroppedCountWord)),
++	    ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone),
++	    ConstantU32(state, 1));
++	state.builder.AddFunction(
++	    spv::OpAtomicExchange, TypeU32(state), state.builder.AllocateId(),
++	    FaultElementPointer(state,
++	                        ConstantU32(state, BdaTailWord + IR::BdaFaultLayout::DroppedPageWord)),
++	    ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone),
++	    Binary(state, spv::OpIAdd, TypeU32(state), page, ConstantU32(state, 1)));
++}
++
++// Runs fn(physical u32 pointer) when the DWORD at the 4-byte aligned address has a cache buffer.
++template <typename Fn>
++void WithBdaWritePointer(EmitterState& state, uint32_t aligned, Fn&& fn) {
++	const auto bda     = GetBdaPointer(state, aligned);
++	const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
++	EmitIfCondition(state, present, [&]() {
++		const auto pointer = state.builder.AllocateId();
++		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda);
++		fn(pointer);
++		MarkBdaWrittenPage(state, aligned);
++	});
++	if (IR::BdaStoreLogEnabled()) {
++		EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), present),
++		                [&]() { RecordDroppedBdaWrite(state, aligned); });
++	}
++}
++
++template <typename Fn>
++uint32_t EmitIndirectAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst, Fn&& operation) {
++	auto&      state  = ctx.state;
++	const auto buffer = PrepareIndirectBuffer(ctx, inst);
++	const auto valid_format =
++	    Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0));
++	const auto in_bounds =
++	    AndCondition(state, valid_format, IndirectBufferInBounds(state, buffer, 0u, 4u, false));
++	return EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
++		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
++		                            ConstantU64(state, ~uint64_t {3}));
++		const auto bda     = GetBdaPointer(state, aligned);
++		const auto present =
++		    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
++		if (IR::BdaStoreLogEnabled()) {
++			EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), present),
++			                [&]() { RecordDroppedBdaWrite(state, aligned); });
++		}
++		return EmitValueOrZeroIfCondition(state, present, [&]() {
++			const auto pointer = state.builder.AllocateId();
++			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
++			                          bda);
++			const auto old = operation(pointer);
++			MarkBdaWrittenPage(state, aligned);
++			return old;
++		});
++	});
++}
++
++void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
++	auto& state = ctx.state;
++	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
++		const auto& mem    = ctx.Memory(inst);
++		const auto  buffer = PrepareIndirectBuffer(ctx, inst);
++		const auto  data   = ctx.Arg(inst, inst.NumArgs() - 2);
++		const auto  valid_format =
++		    Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0));
++		const auto bits = mem.data_bits;
++		if (bits == 8u || bits == 16u) {
++			const auto in_bounds = AndCondition(
++			    state, valid_format, IndirectBufferInBounds(state, buffer, 0u, bits / 8u, false));
++			EmitIfCondition(state, in_bounds, [&]() {
++				const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
++				                            ConstantU64(state, ~uint64_t {3}));
++				const auto low  = Unary(state, spv::OpUConvert, TypeU32(state), buffer.address);
++				const auto shift = Binary(state, spv::OpS
