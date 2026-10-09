@@ -32,7 +32,13 @@ jobs:
           import hashlib, pathlib, shutil, subprocess
           # Cumulative patch vs 7b9997b: V4 Layer A + V4B Layer B (BDA writes, compute overlap allow). Pinned by SHA256.
           expected = "265aea350e932f2dcc754f7101eefde18be8898286c38efd651e9c04a861e313"
-          source = pathlib.Path("kit/descriptor-fix-v4b/descriptor-v4b.patch")
+          kit_dir = pathlib.Path("kit/descriptor-fix-v4b")
+          source = kit_dir / "descriptor-v4b.patch"
+          if not source.is_file():
+              parts = [kit_dir / f"descriptor-v4b.patch.part{i:02d}" for i in range(6)]
+              missing = [str(p) for p in parts if not p.is_file()]
+              assert not missing, f"Missing patch parts: {missing}"
+              source.write_bytes(b"".join(p.read_bytes() for p in parts))
           # Windows runners may check text out with CRLF (core.autocrlf); the pinned patch is LF-only.
           patch = source.read_bytes().replace(b"\r\n", b"\n")
           assert hashlib.sha256(patch).hexdigest() == expected, "Patch checksum mismatch"
@@ -102,7 +108,7 @@ jobs:
               "KytyPS5 descriptor fix V4B (Layer A + Layer B) - EXPERIMENTAL.\n"
               "Layer A = V4 (V2 + V3 + port of KytyPS5 PR #1224 descriptor Phi handling), unchanged.\n"
               "Layer B adds, for compute shaders only:\n"
-              " - BDA writes: raw BUFFER_STORE (dword/x2/x3/x4, byte/short) and 32-bit\n"
+              " - BDA writes: raw 32-bit BUFFER_STORE (dword/x2/x3/x4, byte/short) and 32-bit\n"
               "   BufferAtomic* through a GPU-computed V# are emitted through buffer device address\n"
               "   (PhysicalStorageBuffer) instead of exiting; written 16 KiB pages are recorded in a\n"
               "   bitmap and settled after the dispatch (GPU-dirty marking in the buffer cache).\n"
