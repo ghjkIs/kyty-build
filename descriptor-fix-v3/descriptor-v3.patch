@@ -1,0 +1,741 @@
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+index d596c63..a0a180f 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+@@ -910,7 +910,7 @@ IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst
+ 	    .stride           = stride,
+ 	    .swizzle          = swizzle,
+ 	    .format           = field(word3, 12, 7),
+-	    .selector         = ctx.Memory(inst).formatted ? field(word3, 0, 3) : 0u,
++	    .selector         = ctx.Memory(inst).formatted ? field(word3, 0, 12) : 0u,
+ 	    .mode             = field(word3, 28, 2),
+ 	    .records          = records,
+ 	    .index_in_bounds  = Binary(state, spv::OpULessThan, TypeBool(state), index, records),
+@@ -976,10 +976,13 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
+ 	return ConstructU32Composite(state, components, values);
+ }
+ 
+-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
++uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, const IR::Inst& inst,
++                                        uint32_t output_component) {
+ 	auto& state = ctx.state;
+ 	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+ 		const auto buffer = PrepareIndirectBuffer(ctx, inst);
++		const auto selector = EmitBitFieldUExtract(state, buffer.selector,
++		    ConstantU32(state, output_component * 3u), ConstantU32(state, 3u));
+ 		return EmitIndexSwitch(
+ 		    state, buffer.format, static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u,
+ 		    TypeU32(state), [&](uint32_t format) {
+@@ -987,10 +990,10 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
+ 			    if (info.type == Format::ComponentType::Unknown) return ConstantU32(state, 0);
+ 			    const auto constant = Select(
+ 			        state, TypeU32(state),
+-			        Binary(state, spv::OpIEqual, TypeBool(state), buffer.selector, ConstantU32(state, 1)),
++			        Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1)),
+ 			        FormattedConstant(ctx, info, FormattedSourceKind::One), ConstantU32(state, 0));
+ 			    return EmitValueOrDefaultIfCondition(
+-			        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
++			        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
+ 			                      ConstantU32(state, 4)),
+ 			        TypeU32(state), constant, [&]() {
+ 				        const auto in_bounds = IndirectBufferInBounds(state, buffer, 0u, info.byte_size, true);
+@@ -1013,7 +1016,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
+ 				        if (info.component_count == 1u) return emit_component(0u);
+ 				        const auto component = Binary(
+ 				            state, spv::OpUMod, TypeU32(state),
+-				            Binary(state, spv::OpISub, TypeU32(state), buffer.selector, ConstantU32(state, 4)),
++				            Binary(state, spv::OpISub, TypeU32(state), selector, ConstantU32(state, 4)),
+ 				            ConstantU32(state, info.component_count));
+ 				        return EmitIndexSwitch(state, component, info.component_count, TypeU32(state),
+ 				                               emit_component);
+@@ -1022,6 +1025,28 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
+ 	});
+ }
+ 
++uint32_t LoadIndirectFormattedBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
++                                      uint32_t components) {
++	std::array<uint32_t, 4> values {};
++	for (uint32_t component = 0; component < components; ++component)
++		values[component] = LoadIndirectFormattedComponent(ctx, inst, component);
++	return ConstructU32Composite(ctx.state, components, values);
++}
++
++uint32_t LoadIndirectSubwordBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
++	auto& state = ctx.state;
++	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
++		const auto buffer = PrepareIndirectBuffer(ctx, inst);
++		const auto bits = ctx.Memory(inst).data_bits;
++		const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
++		                                 ConstantU32(state, 0));
++		return LoadBda(ctx, buffer.address,
++		    AndCondition(state, valid_format,
++		                 IndirectBufferInBounds(state, buffer, 0u, bits / 8u, false)),
++		    bits, ctx.Memory(inst).coherent);
++	});
++}
++
+ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+ 	auto& state = ctx.state;
+ 	return EmitValueOrDefaultIfCondition(
+@@ -1029,7 +1054,8 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
+ 	    ConstantU32CompositeZero(state, components), [&]() {
+ 		    const auto mem      = ctx.Memory(inst);
+ 		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+-			    return LoadIndirectBuffer(ctx, inst, components);
++			    return mem.formatted ? LoadIndirectFormattedBuffer(ctx, inst, components)
++			                         : LoadIndirectBuffer(ctx, inst, components);
+ 		    }
+ 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
+ 		    const auto info = Format::GetFormatInfo(
+@@ -1387,6 +1413,9 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
+ 	uint32_t   value;
+ 	if (mem.kind == IR::ResourceKind::FlatLocal)
+ 		value = LoadLocalFlat(ctx, inst);
++	else if (mem.kind == IR::ResourceKind::IndirectBuffer &&
++	         (op == IR::ValueOpcode::LoadBufferU8 || op == IR::ValueOpcode::LoadBufferU16))
++		value = LoadIndirectSubwordBuffer(ctx, inst);
+ 	else if (buffer_components > 1u ||
+ 	         (buffer_components == 1u && mem.kind == IR::ResourceKind::IndirectBuffer && !mem.formatted))
+ 		value = LoadBuffer(ctx, inst, buffer_components);
+@@ -1399,7 +1428,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
+ 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),
+ 		                address_info.data_bits, mem.coherent);
+ 	else if (op == IR::ValueOpcode::LoadBufferU32 && mem.formatted)
+-		value = mem.kind == IR::ResourceKind::IndirectBuffer ? LoadIndirectFormattedX(ctx, inst)
++		value = mem.kind == IR::ResourceKind::IndirectBuffer ? LoadIndirectFormattedBuffer(ctx, inst, 1u)
+ 		                                                     : FormattedLoad(ctx, inst, mem);
+ 	else if (inst.GetType() == IR::Type::U8)
+ 		value = LoadSubword(ctx, inst, mem, 8, false);
+diff --git a/src/graphics/shader/recompiler/ir/Program.cpp b/src/graphics/shader/recompiler/ir/Program.cpp
+index 0405f41..72a058c 100644
+--- a/src/graphics/shader/recompiler/ir/Program.cpp
++++ b/src/graphics/shader/recompiler/ir/Program.cpp
+@@ -467,7 +467,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
+ 				}
+ 				if (memory.kind == ResourceKind::IndirectBuffer &&
+ 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+-					return Fail("indirect buffer requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
++					return Fail("indirect buffer requires a scalar read, raw byte/short/DWORD load, or formatted X/XY/XYZ/XYZW load");
+ 				}
+ 				if (buffer_components > 1u &&
+ 				    (!vector_buffer || memory.data_bits != 32u ||
+diff --git a/src/graphics/shader/recompiler/ir/ShaderIR.h b/src/graphics/shader/recompiler/ir/ShaderIR.h
+index 0e473f6..f18477b 100644
+--- a/src/graphics/shader/recompiler/ir/ShaderIR.h
++++ b/src/graphics/shader/recompiler/ir/ShaderIR.h
+@@ -73,13 +73,15 @@ struct MemoryInfo {
+ 	bool                    planning_only                                         = false;
+ 
+ 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
+-		return !typed && data_bits == 32u &&
+-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
+-		                  : opcode == ValueOpcode::ReadConstBuffer ||
+-		                        opcode == ValueOpcode::LoadBufferU32 ||
+-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
+-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+-		                        opcode == ValueOpcode::LoadBufferU32x4);
++		if (typed) return false;
++		if (!formatted && opcode == ValueOpcode::LoadBufferU8) return data_bits == 8u;
++		if (!formatted && opcode == ValueOpcode::LoadBufferU16) return data_bits == 16u;
++		return data_bits == 32u &&
++		       ((!formatted && opcode == ValueOpcode::ReadConstBuffer) ||
++		        opcode == ValueOpcode::LoadBufferU32 ||
++		        opcode == ValueOpcode::LoadBufferU32x2 ||
++		        opcode == ValueOpcode::LoadBufferU32x3 ||
++		        opcode == ValueOpcode::LoadBufferU32x4);
+ 	}
+ 
+ 	bool operator==(const MemoryInfo& other) const = default;
+diff --git a/src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp b/src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp
+index 472e3a0..b430511 100644
+--- a/src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp
+@@ -9,6 +9,7 @@
+ #include <fmt/format.h>
+ #include <map>
+ #include <optional>
++#include <set>
+ #include <span>
+ #include <tuple>
+ #include <utility>
+@@ -346,12 +347,15 @@ public:
+ 		m_info.sampled_pairs.clear();
+ 		m_info.uses_dma = false;
+ 		m_shader_writes = HasShaderMemoryWrites(program);
++		m_terminal_store_handle = FindTerminalStoreHandle();
+ 	}
+ 
+ 	void Run() {
+ 		if (m_program.resource_tracking_complete) {
+ 			Fail(0, "resources already tracked");
+ 		}
++		// V3: before any MakeSource call caches a descriptor source for these handles.
++		FindUniformAtomicDescriptorPhis();
+ 		FoldBoundedLoopSelectors();
+ 		PlanScalarReads();
+ 		EliminateDeadCode(m_program.blocks);
+@@ -609,56 +613,222 @@ private:
+ 		return selected.IsEmpty() ? value : selected;
+ 	}
+ 
+-	Value LowerDescriptorPhi(Value value) {
+-		value           = value.Resolve();
+-		const auto* phi = value.TryInstruction();
+-		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
+-		    phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u || phi->GetType() != Type::U32) {
+-			return value;
+-		}
+-		const auto* merge = phi->Parent();
+-		const auto* branch = phi->PhiBlock(0);
+-		if (merge == nullptr || branch == nullptr || phi->PhiBlock(1) == nullptr ||
+-		    branch == phi->PhiBlock(1)) {
+-			return value;
++	const Inst* FindTerminalStoreHandle() const {
++		// A descriptor computed before the sole, final write can use the same
++		// host resource-binding path as a straight-line scalar descriptor.
++		// Do not extend this to loops, read-after-write, or multiple writes.
++		const Inst* store = nullptr;
++		std::map<const Block*, uint32_t> remaining;
++		std::vector<const Block*> ready;
++		for (const auto* block: m_program.blocks) {
++			remaining[block] = static_cast<uint32_t>(block->ImmPredecessors().size());
++			if (block->ImmPredecessors().empty()) ready.push_back(block);
++			bool after_store = false;
++			for (const auto& inst: *block) {
++				if (after_store) return nullptr;
++				const auto op = inst.GetOpcode();
++				const auto buffer = BufferAccessOf(op);
++				const auto image = ImageOpcodeInfoOf(op).access;
++				if (buffer != BufferAccess::Write && buffer != BufferAccess::Atomic &&
++				    image != ImageAccess::Write && image != ImageAccess::Atomic &&
++				    AddressOpcodeInfoOf(op).access != AddressAccess::Write) continue;
++				if (store != nullptr || op != ValueOpcode::StoreBufferU32 ||
++				    !block->ImmSuccessors().empty() ||
++				    block->terminator.kind != CFG::TerminatorKind::Return) return nullptr;
++				store = &inst;
++				after_store = true;
++			}
++		}
++		if (store == nullptr) return nullptr;
++		for (size_t i = 0; i < ready.size(); ++i) {
++			for (const auto* next: ready[i]->ImmSuccessors()) {
++				auto found = remaining.find(next);
++				if (found == remaining.end() || found->second == 0) return nullptr;
++				if (--found->second == 0) ready.push_back(next);
++			}
++		}
++		if (ready.size() != m_program.blocks.size()) return nullptr;
++		return store->Arg(0).ResolveInstruction();
++	}
++
++	// Structural checks shared by every host-side descriptor Phi lowering: a
++	// two-arm diamond (or triangle) whose branch condition and both incoming
++	// values are uniform runtime values (LaneId and other per-lane values fail
++	// ValidateRuntimeValue).
++	bool UniformDescriptorDiamond(const Inst& phi, const Block*& branch,
++	                              std::array<const Block*, 2>& targets) const {
++		if (phi.GetOpcode() != ValueOpcode::Phi || phi.NumArgs() != 2u ||
++		    phi.NumPhiBlocks() != 2u || phi.GetType() != Type::U32) {
++			return false;
+ 		}
+-		for (const auto& [original, selected]: m_descriptor_selections) {
+-			if (original == phi) {
+-				return selected;
+-			}
++		const auto* merge = phi.Parent();
++		branch = phi.PhiBlock(0);
++		if (merge == nullptr || branch == nullptr || phi.PhiBlock(1) == nullptr ||
++		    branch == phi.PhiBlock(1)) {
++			return false;
+ 		}
+ 		if (branch->ImmSuccessors().size() != 2u) {
+ 			if (branch->ImmPredecessors().size() != 1u) {
+-				return value;
++				return false;
+ 			}
+ 			branch = branch->ImmPredecessors()[0];
+ 		}
+ 		if (branch == merge || branch->ImmSuccessors().size() != 2u) {
+-			return value;
++			return false;
+ 		}
+-		std::array<const Block*, 2> targets;
+ 		for (uint32_t arm = 0; arm < 2; arm++) {
+-			const auto* incoming = phi->PhiBlock(arm);
++			const auto* incoming = phi.PhiBlock(arm);
+ 			if (incoming == merge ||
+ 			    (incoming != branch &&
+ 			     (incoming->ImmPredecessors().size() != 1u ||
+ 			      incoming->ImmPredecessors()[0] != branch ||
+ 			      incoming->ImmSuccessors().size() != 1u ||
+ 			      incoming->ImmSuccessors()[0] != merge))) {
+-				return value;
++				return false;
+ 			}
+ 			targets[arm] = incoming == branch ? merge : incoming;
+ 		}
+-		const auto& info = *branch;
+-		const auto& term = info.terminator;
+-		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
+-		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
+-		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
+-		    !ValidateRuntimeValue(m_program, info.condition, RuntimeValueType::Integer) ||
+-		    !ValidateRuntimeValue(m_program, phi->Arg(0)) ||
+-		    !ValidateRuntimeValue(m_program, phi->Arg(1))) {
++		const auto& term = branch->terminator;
++		return term.kind == CFG::TerminatorKind::ConditionalBranch &&
++		       ((term.true_block == targets[0] && term.false_block == targets[1]) ||
++		        (term.false_block == targets[0] && term.true_block == targets[1])) &&
++		       ValidateRuntimeValue(m_program, branch->condition, RuntimeValueType::Integer) &&
++		       ValidateRuntimeValue(m_program, phi.Arg(0)) &&
++		       ValidateRuntimeValue(m_program, phi.Arg(1));
++	}
++
++	static bool WritesMemory(const Inst& inst) {
++		const auto op = inst.GetOpcode();
++		const auto buffer = BufferAccessOf(op);
++		const auto image = ImageOpcodeInfoOf(op).access;
++		return buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
++		       image == ImageAccess::Write || image == ImageAccess::Atomic ||
++		       AddressOpcodeInfoOf(op).access == AddressAccess::Write;
++	}
++
++	// V3: a merged scalar buffer address may feed several BufferAtomic* sites
++	// (Ace Combat 8 CS 0x1d81bb2b74faf456: Phi -> BitwiseOr32 flag ->
++	// GetBufferResource -> 4x BufferAtomicOr32). Such a Phi qualifies for host
++	// Select lowering when it is a uniform diamond that is not inside a cycle and
++	// that no shader write can precede, so the host-evaluated descriptor reads
++	// observe the same memory as the GPU. Lane-dependent selection still fails.
++	void FindUniformAtomicDescriptorPhis() {
++		m_uniform_atomic_phis.clear();
++		std::set<const Inst*> rejected;
++		const auto unwrap = [](Value word) -> const Inst* {
++			word = word.Resolve();
++			const auto* inst = word.TryInstruction();
++			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::BitwiseOr32 &&
++			    inst->NumArgs() == 2u) {
++				for (uint32_t side = 0; side < 2u; ++side) {
++					const auto flag = inst->Arg(side ^ 1u).Resolve();
++					const auto* input = inst->Arg(side).Resolve().TryInstruction();
++					if (flag.IsImmediate() && input != nullptr &&
++					    input->GetOpcode() == ValueOpcode::Phi)
++						return input;
++				}
++				return nullptr;
++			}
++			return inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi ? inst : nullptr;
++		};
++		const auto reaches = [](const Block* from, const Block* to, bool forward) {
++			std::vector<const Block*> pending {from};
++			std::set<const Block*> seen;
++			while (!pending.empty()) {
++				const auto* block = pending.back();
++				pending.pop_back();
++				if (!seen.insert(block).second) continue;
++				if (block == to) return true;
++				const auto next = forward ? block->ImmSuccessors() : block->ImmPredecessors();
++				pending.insert(pending.end(), next.begin(), next.end());
++			}
++			return false;
++		};
++		const auto write_free_prefix = [&](const Block* start) {
++			// Every block that can execute before 'start' (and 'start' itself).
++			std::vector<const Block*> pending {start};
++			std::set<const Block*> seen;
++			while (!pending.empty()) {
++				const auto* block = pending.back();
++				pending.pop_back();
++				if (!seen.insert(block).second) continue;
++				for (const auto& inst: *block)
++					if (WritesMemory(inst)) return false;
++				const auto preds = block->ImmPredecessors();
++				pending.insert(pending.end(), preds.begin(), preds.end());
++			}
++			return true;
++		};
++		for (const auto* block: m_program.blocks) {
++			for (const auto& inst: *block) {
++				if (inst.GetOpcode() != ValueOpcode::GetBufferResource) continue;
++				const bool atomic = std::ranges::any_of(inst.Uses(), [&](const Use& use) {
++					return use.user != nullptr && use.operand == 0u &&
++					       BufferAccessOf(use.user->GetOpcode()) == BufferAccess::Atomic;
++				});
++				if (!atomic) continue;
++				for (uint32_t word = 0; word < inst.NumArgs(); ++word) {
++					const auto* phi = unwrap(inst.Arg(word));
++					if (phi == nullptr || m_uniform_atomic_phis.contains(phi) ||
++					    rejected.contains(phi))
++						continue;
++					const Block* branch = nullptr;
++					std::array<const Block*, 2> targets {};
++					bool ok = UniformDescriptorDiamond(*phi, branch, targets);
++					const auto* merge = phi->Parent();
++					// Loops: the diamond must not be re-entered from its merge.
++					ok = ok && !reaches(merge, branch, true);
++					// No write may execute before either incoming value is produced.
++					ok = ok && write_free_prefix(phi->PhiBlock(0)) &&
++					     write_free_prefix(phi->PhiBlock(1));
++					if (ok) m_uniform_atomic_phis.insert(phi);
++					else rejected.insert(phi);
++				}
++			}
++		}
++	}
++
++	Value LowerDescriptorPhi(Value value, bool terminal_store = false) {
++		value           = value.Resolve();
++		const auto* phi = value.TryInstruction();
++		// S_BITSET1 on the merged high address word adds descriptor flags after
++		// the Phi. Clone only this host expression; preserve GPU SSA and uses.
++		// V3: the same wrapper is accepted when the wrapped Phi was proven to be a
++		// uniform, write-free diamond feeding BufferAtomic* (any number of uses).
++		if (phi != nullptr && phi->GetOpcode() == ValueOpcode::BitwiseOr32) {
++			for (uint32_t side = 0; side < 2u; ++side) {
++				const auto flag = phi->Arg(side ^ 1u).Resolve();
++				const auto input = phi->Arg(side).Resolve();
++				const auto* merge = input.TryInstruction();
++				if (!flag.IsImmediate() || merge == nullptr ||
++				    merge->GetOpcode() != ValueOpcode::Phi) continue;
++				if (!terminal_store && !m_uniform_atomic_phis.contains(merge)) continue;
++				const auto selected = LowerDescriptorPhi(input, terminal_store);
++				if (selected == input) return value;
++				auto& result = m_program.value_storage.emplace_back(ValueOpcode::BitwiseOr32);
++				result.SetArg(side, selected);
++				result.SetArg(side ^ 1u, flag);
++				return Value(&result);
++			}
++		}
++		const bool uniform_atomic = phi != nullptr && m_uniform_atomic_phis.contains(phi);
++		if ((m_shader_writes && !terminal_store && !uniform_atomic) || phi == nullptr ||
++		    phi->GetOpcode() != ValueOpcode::Phi ||
++		    phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u || phi->GetType() != Type::U32) {
+ 			return value;
+ 		}
++		for (const auto& [original, selected]: m_descriptor_selections) {
++			if (original == phi) {
++				return selected;
++			}
++		}
++		const Block* branch = nullptr;
++		std::array<const Block*, 2> targets {};
++		if (!UniformDescriptorDiamond(*phi, branch, targets)) {
++			return value;
++		}
++		const auto& info = *branch;
++		const auto& term = info.terminator;
+ 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
+ 		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
+ 		auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+@@ -686,7 +856,7 @@ private:
+ 		for (uint32_t i = 0; i < width; i++) {
+ 			const auto value = base_reg != UINT32_MAX
+ 			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
+-			descriptor.dwords[i] = LowerDescriptorPhi(value);
++			descriptor.dwords[i] = LowerDescriptorPhi(value, &handle == m_terminal_store_handle);
+ 		}
+ 		if (sample_adjust) {
+ 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
+@@ -2266,9 +2436,11 @@ private:
+ 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+ 				                                                        : ResourceKind::Buffer) ||
+ 				    !memory.SupportsIndirectBufferLoad(op)) {
+-					Fail(flags.pc,
+-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
+-					     "requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
++					Fail(flags.pc, fmt::format(
++					    "buffer descriptor is not a valid runtime value; unsupported GPU-selected "
++					    "access: opcode={} bits={} dwords={} formatted={} typed={} kind={}",
++					    ValueOpcodeName(op), memory.data_bits, memory.data_dwords,
++					    memory.formatted, memory.typed, static_cast<unsigned>(memory.kind)));
+ 				}
+ 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+ 				m_info.uses_dma                         = true;
+@@ -2398,6 +2570,8 @@ private:
+ 	std::vector<MemoryPatch>                   m_memory_patches;
+ 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
+ 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
++	const Inst*                                m_terminal_store_handle = nullptr;
++	std::set<const Inst*>                      m_uniform_atomic_phis;
+ 	bool                                       m_shader_writes = false;
+ };
+ 
+diff --git a/tests/ResourceTrackingTests.cpp b/tests/ResourceTrackingTests.cpp
+index d82a18d..7708ead 100644
+--- a/tests/ResourceTrackingTests.cpp
++++ b/tests/ResourceTrackingTests.cpp
+@@ -2358,6 +2358,200 @@ void TestDynamicSrtReadRemainsExplicit() {
+         "dynamic scalar read received the wrong resource usage");
+ }
+ 
++// Models the uploaded shader's diamond, merged base address, and stride flag.
++ResourcePlan TerminalStorePlan(unsigned rejected_case = 0) {
++  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
++  Fixture f;
++  auto* entry = f.block;
++  auto* left = f.AddBlock();
++  auto* right = f.AddBlock();
++  auto* merge = f.AddBlock();
++  entry->AddBranch(left); entry->AddBranch(right);
++  left->AddBranch(merge); right->AddBranch(merge);
++  entry->terminator = {.kind=CFG::TerminatorKind::ConditionalBranch,
++                      .true_block=left, .false_block=right};
++  left->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=merge};
++  right->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=merge};
++  entry->condition = rejected_case == 1 ? f.Emit(ValueOpcode::ULessThan32,
++      {f.Emit(ValueOpcode::LaneId), Value(1u)}) :
++      f.Emit(ValueOpcode::INotEqual32, {f.UserData(0), Value(0u)});
++  auto address = f.Address(Value(0x1000u), Value(0u));
++  auto read = [&](Block* block, uint32_t offset) {
++    MemoryInfo m; m.kind=ResourceKind::ScalarAddress; m.offset=offset;
++    return f.Emit(ValueOpcode::LoadAddressU32,
++        {address, Value(0u), Value(0u), Value(true)}, f.AddMemory(m, 0x10+offset), block);
++  };
++  auto lo0=read(left,0), hi0=read(left,4);
++  auto lo1=read(right,8), hi1=read(right,12);
++  auto& lo=merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
++  lo.AddPhiOperand(left,lo0); lo.AddPhiOperand(right,lo1);
++  auto& hi=merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
++  hi.AddPhiOperand(left,hi0); hi.AddPhiOperand(right,hi1);
++  auto high=f.Emit(ValueOpcode::BitwiseOr32,{Value(&hi),Value(0x40000u)},0,merge);
++  auto handle=f.Emit(ValueOpcode::GetBufferResource,
++      {Value(&lo),high,Value(100u),Value(0x16204u)},MemoryFlags{0,0x84},merge);
++  MemoryInfo m; m.kind=ResourceKind::Buffer;
++  if (rejected_case == 2) {
++    auto prior=f.Buffer({Value(0x2000u),Value(0x40000u),Value(100u),Value(0x16204u)});
++    f.Emit(ValueOpcode::StoreBufferU32,
++        {prior,Value(0u),Value(0u),Value(0u),Value(0u),Value(true)},f.AddMemory(m,4),entry);
++  }
++  f.Emit(ValueOpcode::StoreBufferU32,
++      {handle,Value(4u),Value(0u),Value(0u),Value(0u),Value(true)},f.AddMemory(m,0x84),merge);
++  if (rejected_case == 3) {
++    merge->AddBranch(entry);
++    merge->terminator={.kind=CFG::TerminatorKind::Branch,.true_block=entry};
++  }
++  if (rejected_case == 4) read(merge,16);
++  f.PlanAndTrack();
++  Check(lo.GetOpcode()==ValueOpcode::Phi && hi.GetOpcode()==ValueOpcode::Phi &&
++        high.Instruction()->Arg(0).Instruction()==&hi,
++        "terminal store planning changed GPU SSA");
++  Check(f.program.info.buffers.size()==1 && f.program.info.buffers[0].written,
++        "terminal store lost its writable buffer binding");
++  EliminateDeadCode(f.program.blocks);
++  ValidateProgram(f.program,true);
++  return ExtractResourcePlan(f.program);
++}
++
++void TestTerminalStoreDescriptorPhi() {
++  auto plan=TerminalStorePlan();
++  TestMemory memory; memory.words={0x3000u,1u,0x4000u,2u};
++  for (uint32_t flag : {0u,1u}) {
++    std::array<uint32_t,64> user{}; user[0]=flag;
++    SrtRuntime runtime{.user_data=user,.read_memory=ReadTestMemory,.userdata=&memory,
++                       .read_specialization_memory=ReadTestMemory};
++    DescriptorValue value;
++    SrtWalker clean(plan,CleanRuntime(runtime));
++    Check(SrtWalker(plan,runtime,&clean).EvaluateDescriptor(plan.info.buffers[0].source,value),
++          "terminal store descriptor evaluation failed");
++    Check(value.dwords[0]==(flag ? 0x3000u:0x4000u) &&
++          value.dwords[1]==((flag ? 1u:2u)|0x40000u),
++          "terminal store selected wrong base or lost stride flag");
++  }
++  for (unsigned mode : {1u,2u,3u,4u})
++    CheckFatal([&]{TerminalStorePlan(mode);},"not a valid runtime value",
++               "unsafe writable descriptor selection accepted");
++}
++
++// V3: Ace Combat 8 CS 0x1d81bb2b74faf456 merges a scalar buffer address in a
++// uniform diamond, ORs a flag into the high word, and feeds several
++// BufferAtomicOr32 sites (plus unrelated stores) from the same Phi.
++ResourcePlan UniformAtomicPlan(unsigned rejected_case = 0,
++                               ValueOpcode atomic_op = ValueOpcode::BufferAtomicOr32) {
++  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
++  Fixture f;
++  auto* entry = f.block;
++  auto* left = f.AddBlock();
++  auto* right = f.AddBlock();
++  auto* merge = f.AddBlock();
++  auto* tail = f.AddBlock();
++  entry->AddBranch(left); entry->AddBranch(right);
++  left->AddBranch(merge); right->AddBranch(merge);
++  merge->AddBranch(tail);
++  entry->terminator = {.kind=CFG::TerminatorKind::ConditionalBranch,
++                      .true_block=left, .false_block=right};
++  left->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=merge};
++  right->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=merge};
++  merge->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=tail};
++  if (rejected_case == 4) {
++    // Write-free loop around the diamond; all writes happen after the loop exits.
++    merge->AddBranch(entry);
++    merge->terminator = {.kind=CFG::TerminatorKind::ConditionalBranch,
++                        .true_block=tail, .false_block=entry};
++    merge->condition = f.Emit(ValueOpcode::INotEqual32, {f.UserData(1), Value(0u)});
++  }
++  entry->condition = rejected_case == 1 ? f.Emit(ValueOpcode::ULessThan32,
++      {f.Emit(ValueOpcode::LaneId), Value(1u)}) :
++      f.Emit(ValueOpcode::INotEqual32, {f.UserData(0), Value(0u)});
++  auto address = f.Address(Value(0x1000u), Value(0u));
++  auto read = [&](Block* block, uint32_t offset) {
++    MemoryInfo m; m.kind=ResourceKind::ScalarAddress; m.offset=offset;
++    return f.Emit(ValueOpcode::LoadAddressU32,
++        {address, Value(0u), Value(0u), Value(true)}, f.AddMemory(m, 0x10+offset), block);
++  };
++  auto lo0=read(left,0), hi0=read(left,4);
++  auto lo1=read(right,8), hi1=read(right,12);
++  auto& lo=merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
++  lo.AddPhiOperand(left,lo0); lo.AddPhiOperand(right,lo1);
++  auto& hi=merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
++  hi.AddPhiOperand(left,hi0); hi.AddPhiOperand(right,hi1);
++  auto high=f.Emit(ValueOpcode::BitwiseOr32,{Value(&hi),Value(0x40000u)},0,merge);
++  MemoryInfo m; m.kind=ResourceKind::Buffer;
++  if (rejected_case == 2) {
++    // A write before the descriptor reads could alias them; host values would be stale.
++    auto prior=f.Buffer({Value(0x2000u),Value(0x40000u),Value(100u),Value(0x16204u)});
++    f.Emit(ValueOpcode::StoreBufferU32,
++        {prior,Value(0u),Value(0u),Value(0u),Value(0u),Value(true)},f.AddMemory(m,4),entry);
++  }
++  // Unrelated straight-line store between the atomics: V2's sole-terminal-store
++  // rule rejects this shape, V3 must not.
++  auto other=f.Buffer({f.UserData(6),Value(0x400000u),Value(100u),Value(0x10016204u)});
++  f.Emit(ValueOpcode::StoreBufferU32,
++      {other,Value(0u),Value(0u),Value(0u),Value(5u),Value(true)},f.AddMemory(m,0x90),
++      rejected_case == 4 ? tail : merge);
++  std::vector<Value> handles;
++  for (uint32_t site = 0; site < 2u; ++site) {
++    auto* block = site == 0 && rejected_case != 4 ? merge : tail;
++    const uint32_t pc = 0x1a0u + site * 0xc0u;
++    auto handle=f.Emit(ValueOpcode::GetBufferResource,
++        {Value(&lo),high,Value(100u),Value(0x16204u)},MemoryFlags{0,pc},block);
++    // Result unused, as in the shader; the atomic itself is a side effect.
++    f.Emit(atomic_op,
++        {handle,Value(1u),Value(0u),Value(0u),Value(0u),Value(true)},f.AddMemory(m,pc),block);
++    handles.push_back(handle);
++  }
++  if (rejected_case == 3) {
++    tail->AddBranch(entry);
++    tail->terminator={.kind=CFG::TerminatorKind::Branch,.true_block=entry};
++  }
++  f.PlanAndTrack();
++  Check(lo.GetOpcode()==ValueOpcode::Phi && hi.GetOpcode()==ValueOpcode::Phi &&
++        high.Instruction()->Arg(0).Instruction()==&hi &&
++        handles[0].Instruction()->Arg(0).Instruction()==&lo &&
++        handles[1].Instruction()->Arg(0).Instruction()==&lo,
++        "uniform atomic planning changed GPU SSA");
++  Check(f.program.info.buffers.size()==2,
++        "uniform atomic descriptor was not shared by both atomic sites");
++  Check(handles[0].Instruction()->Flags<uint32_t>()==handles[1].Instruction()->Flags<uint32_t>(),
++        "atomic sites using the same Phi were bound to different buffers");
++  const auto& atomic_buffer=f.program.info.buffers[handles[0].Instruction()->Flags<uint32_t>()];
++  Check(atomic_buffer.written && atomic_buffer.atomic && atomic_buffer.read,
++        "uniform atomic descriptor lost its writable/atomic buffer binding");
++  for (const auto& memory : f.program.memory_info)
++    Check(memory.kind!=ResourceKind::IndirectBuffer,
++          "uniform atomic descriptor fell back to an indirect buffer");
++  EliminateDeadCode(f.program.blocks);
++  ValidateProgram(f.program,true);
++  return ExtractResourcePlan(f.program);
++}
++
++void TestUniformAtomicDescriptorPhi() {
++  for (const auto op : {ValueOpcode::BufferAtomicOr32, ValueOpcode::BufferAtomicIAdd32}) {
++    auto plan=UniformAtomicPlan(0, op);
++    TestMemory memory; memory.words={0x3000u,1u,0x4000u,2u};
++    const auto atomic_index = plan.info.buffers[0].atomic ? 0u : 1u;
++    for (uint32_t flag : {0u,1u}) {
++      std::array<uint32_t,64> user{}; user[0]=flag; user[6]=0x9000u;
++      SrtRuntime runtime{.user_data=user,.read_memory=ReadTestMemory,.userdata=&memory,
++                         .read_specialization_memory=ReadTestMemory};
++      DescriptorValue value;
++      SrtWalker clean(plan,CleanRuntime(runtime));
++      Check(SrtWalker(plan,runtime,&clean).EvaluateDescriptor(
++                plan.info.buffers[atomic_index].source,value),
++            "uniform atomic descriptor evaluation failed");
++      Check(value.dwords[0]==(flag ? 0x3000u:0x4000u) &&
++            value.dwords[1]==((flag ? 1u:2u)|0x40000u),
++            "uniform atomic descriptor selected wrong base or lost flag");
++    }
++  }
++  for (unsigned mode : {1u,2u,3u,4u})
++    CheckFatal([&]{UniformAtomicPlan(mode);},"not a valid runtime value",
++               "unsafe atomic descriptor selection accepted");
++  CheckFatal([&]{UniformAtomicPlan(1u);},"opcode=BufferAtomicOr32",
++             "lane-dependent atomic descriptor lost its opcode diagnostic");
++}
++
+ void TestWritableDescriptorPhi() {
+   Fixture fixture;
+   auto *left = fixture.block;
+@@ -3539,6 +3733,57 @@ void TestMalformedMemoryKindsRejected() {
+   }
+ }
+ 
++void TestExpandedIndirectBufferReads() {
++  const std::array opcodes{ValueOpcode::LoadBufferU8, ValueOpcode::LoadBufferU16,
++                          ValueOpcode::LoadBufferU32, ValueOpcode::LoadBufferU32x2,
++                          ValueOpcode::LoadBufferU32x3, ValueOpcode::LoadBufferU32x4};
++  for (const auto opcode : opcodes) {
++    for (const bool formatted : {false, true}) {
++      const auto bits = opcode == ValueOpcode::LoadBufferU8 ? 8u
++                      : opcode == ValueOpcode::LoadBufferU16 ? 16u : 32u;
++      if (formatted && bits != 32u) continue;
++      Fixture fixture;
++      fixture.program.shader_hash = 0xfeed0001ull;
++      const auto lane = fixture.Emit(ValueOpcode::LaneId);
++      const auto handle = fixture.Buffer({lane, Value(0u), Value(64u), Value(0u)}, 0x84);
++      MemoryInfo memory;
++      memory.kind = ResourceKind::Buffer;
++      memory.data_bits = bits;
++      memory.data_dwords = BufferComponentCount(opcode);
++      memory.formatted = formatted;
++      const auto loaded = fixture.Emit(opcode,
++          {handle, Value(0u), Value(0u), Value(0u), Value(true)},
++          fixture.AddMemory(memory, 0x84));
++      // Keep the vector/subword result live without changing its type.
++      fixture.Emit(ValueOpcode::Reference, {loaded});
++      fixture.PlanAndTrack();
++      Check(fixture.program.memory_info[0].kind == ResourceKind::IndirectBuffer,
++            "GPU-dependent buffer read was not retained for execution on the GPU");
++      Check(fixture.program.info.uses_dma && fixture.program.info.buffers.empty(),
++            "indirect read incorrectly acquired a static buffer binding");
++      Check(handle.ResolveInstruction()->Arg(0).Resolve() == lane.Resolve(),
++            "indirect descriptor was replaced instead of preserved");
++    }
++  }
++  for (const auto opcode : {ValueOpcode::StoreBufferU32, ValueOpcode::BufferAtomicIAdd32}) {
++    Fixture fixture;
++    const auto handle = fixture.Buffer(
++        {fixture.Emit(ValueOpcode::LaneId), Value(0u), Value(64u), Value(0u)}, 0x84);
++    MemoryInfo memory;
++    memory.kind = ResourceKind::Buffer;
++    const auto operation = fixture.Emit(opcode,
++        {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
++        fixture.AddMemory(memory, 0x84));
++    if (operation.GetType() != Type::Void) fixture.Emit(ValueOpcode::Reference, {operation});
++    CheckFatal([&] { fixture.PlanAndTrack(); }, ValueOpcodeName(opcode),
++               "unsupported dynamic writes lost their opcode diagnostic");
++  }
++  MemoryInfo typed;
++  typed.typed = true;
++  Check(!typed.SupportsIndirectBufferLoad(ValueOpcode::LoadBufferU32),
++        "typed loads were enabled without a typed backend");
++}
++
+ } // namespace
+ 
+ int main() {
+@@ -3550,6 +3795,7 @@ int main() {
+         throw std::runtime_error(std::string(name) + ": " + exception.what());
+       }
+     };
++    Run("expanded indirect reads", TestExpandedIndirectBufferReads);
+     Run("dense buffers", TestDenseBufferTracking);
+     Run("compute buffer fill", TestComputeBufferFill);
+     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+@@ -3569,6 +3815,8 @@ int main() {
+     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
+     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
+     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
++    Run("terminal store descriptor phi", TestTerminalStoreDescriptorPhi);
++    Run("uniform atomic descriptor phi", TestUniformAtomicDescriptorPhi);
+     Run("writable descriptor phi", TestWritableDescriptorPhi);
+     Run("conditional sampler phi", TestConditionalSamplerPhi);
+     Run("finite image phi cycle", TestFiniteImagePhiCycle);
