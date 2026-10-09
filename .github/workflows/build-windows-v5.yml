@@ -1,1 +1,167 @@
-placeholder
+name: Build KytyPS5 descriptor fix V5 (V4B + V5-B host Phi-lower for raw loads) for Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out the exact official revision
+        uses: actions/checkout@v4
+        with:
+          repository: KytyPS5/KytyPS5
+          ref: 7b9997baea0d385e9e8fc2bd3abeb02110bc4148
+          path: source
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check out the V5 kit (this branch) for the patch
+        uses: actions/checkout@v4
+        with:
+          path: kit
+          persist-credentials: false
+
+      - name: Verify and apply the experimental V5 patch
+        shell: python
+        run: |
+          import hashlib, pathlib, shutil, subprocess
+          # Cumulative patch vs 7b9997b: V4 Layer A + V4B Layer B (BDA writes, compute overlap allow). Pinned by SHA256.
+          expected = "6212fc121db62685ca327d14503ef6297de8b949315c89339062cccf3757f00b"
+          kit_dir = pathlib.Path("kit/descriptor-fix-v5")
+          source = kit_dir / "descriptor-v5.patch"
+          if not source.is_file():
+              parts = [kit_dir / f"descriptor-v5.patch.part{i:02d}" for i in range(3)]
+              missing = [str(p) for p in parts if not p.is_file()]
+              assert not missing, f"Missing patch parts: {missing}"
+              source.write_bytes(b"".join(p.read_bytes() for p in parts))
+          # Windows runners may check text out with CRLF (core.autocrlf); the pinned patch is LF-only.
+          patch = source.read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(patch).hexdigest() == expected, "Patch checksum mismatch"
+          path = pathlib.Path("descriptor-v5.patch").resolve()
+          path.write_bytes(patch)
+          subprocess.run(["git", "-C", "source", "apply", "--check", str(path)], check=True)
+          subprocess.run(["git", "-C", "source", "apply", str(path)], check=True)
+          subprocess.run(["git", "-C", "source", "diff", "--check"], check=True)
+
+      - name: Set up Visual Studio x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vcpkgRoot = Split-Path (Get-Command vcpkg -ErrorAction Stop).Source
+          & vcpkg install 'glslang[tools,opt]:x64-windows'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure the patched source
+        shell: cmd
+        run: >-
+          cmake -S source -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          -DKYTY_BUILD_ORIGIN=Source
+
+      - name: Compile the launcher, emulator, and regression tests
+        shell: cmd
+        run: cmake --build build --target launcher kyty_emulator resource_tracking_tests --parallel 4
+
+      - name: Run resource-tracking regression tests
+        shell: cmd
+        run: ctest --test-dir build -R "^resource_tracking$" --output-on-failure
+
+      - name: Stage a runnable Windows installation
+        shell: cmd
+        run: cmake --install build --prefix install
+
+      - name: Verify executables and attach provenance
+        shell: python
+        run: |
+          import pathlib, shutil, subprocess, zipfile
+          install = pathlib.Path("install")
+          for filename in ("launcher.exe", "kyty_emulator.exe"):
+              assert (install / filename).is_file(), f"Missing {filename}"
+          shutil.copy2("descriptor-v5.patch", install / "descriptor-v5.patch")
+          shutil.copy2("source/LICENSE", install / "LICENSE")
+          shutil.copytree("source/LICENSES", install / "LICENSES", dirs_exist_ok=True)
+          (install / "BUILD-INFO.txt").write_text(
+              "KytyPS5 descriptor fix V5 (Layer A + Layer B) - EXPERIMENTAL.\n"
+              "Includes V4 Layer A + V4B Layer B + V5-B host Phi-lower for raw loads.\n"
+              "V5-B: uniform Phis feeding LoadBufferU8/U16/U32* bind a normal buffer.\n"
+              " - BDA writes: raw 32-bit BUFFER_STORE (dword/x2/x3/x4, byte/short) and 32-bit\n"
+              "   BufferAtomic* through a GPU-computed V# are emitted through buffer device address\n"
+              "   (PhysicalStorageBuffer) instead of exiting; written 16 KiB pages are recorded in a\n"
+              "   bitmap and settled after the dispatch (GPU-dirty marking in the buffer cache).\n"
+              "   KYTY_BDA_WRITES: default ON; 0/off disables; verify makes dropped/overflowing writes fatal.\n"
+              "   KYTY_BDA_STORE_LOG=1 (default off): log dropped BDA writes (unmapped pages).\n"
+              " - descriptors.cpp: 'scalar resource reads overlap a shader buffer write' is allowed (and\n"
+              "   logged once per shader as 'descriptors: V4B allowing compute scalar-read/buffer-write\n"
+              "   overlap') ONLY for single-stage compute dispatches with BDA writes enabled\n"
+              "   (Ace Combat 8 PPSA24913 CS 0xe41c5e833516362b). Graphics/image overlaps still EXIT.\n"
+              "NOT included: Jetsku software RT, AMD wave32/LDS, skip-instead-of-exit, launcher settings,\n"
+              "Ace Combat 8 and Astro Bot compatibility are UNVERIFIED; no game/GPU run was performed.\n"
+              "Upstream: https://github.com/KytyPS5/KytyPS5\n"
+              "Base: 7b9997baea0d385e9e8fc2bd3abeb02110bc4148\n"
+              "Patch SHA256: 6212fc121db62685ca327d14503ef6297de8b949315c89339062cccf3757f00b\n"
+              "Resource-tracking tests passed in this build.\n", encoding="utf-8")
+          (install / "Run-PPSA24913-Diagnostic-V5.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V5" --printf-direction File --printf-output-file "ace-combat-detail-v5.txt" > "ace-combat-log-v5.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          # Include the modified tracked source and the pinned submodule list for review.
+          entries = subprocess.check_output(["git", "-C", "source", "ls-files", "--stage", "-z"]).decode().split("\0")
+          with zipfile.ZipFile("patched-source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+              for entry in entries:
+                  if not entry:
+                      continue
+                  meta, name = entry.split("\t", 1)
+                  if meta.startswith("160000 "):
+                      continue
+                  archive.write(pathlib.Path("source") / name, name)
+              refs = subprocess.check_output(["git", "-C", "source", "submodule", "status", "--recursive"])
+              archive.writestr("PINNED-SUBMODULES.txt", refs)
+              archive.write("descriptor-v5.patch", "descriptor-v5.patch")
+
+      - name: Downloadable Windows executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Descriptor-Fix-V5-Windows-x64
+          path: install/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Downloadable modified source
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Descriptor-Fix-V5-Source
+          path: patched-source.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Test diagnostics if the build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-V5-Build-Diagnostics
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 14
