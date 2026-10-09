@@ -1,0 +1,412 @@
++				pending.push_back(inst->Arg(index));
++		}
++		return phis;
++	}
++
++	// V4 (#1224): shader writes may alias scalar memory (including on a later
++	// loop visit) but never user data. A branch condition that reads no memory
++	// cannot observe this shader's writes. Conservative: unknown => reads memory.
++	static bool ReadsMemory(Value value) {
++		std::vector<Value> pending {value};
++		std::set<const Inst*> visited;
++		while (!pending.empty()) {
++			const auto* inst = pending.back().Resolve().TryInstruction();
++			pending.pop_back();
++			if (inst == nullptr || !visited.insert(inst).second) continue;
++			if (visited.size() > 4096u) return true;
++			const auto op = inst->GetOpcode();
++			if (op == ValueOpcode::ReadConst || op == ValueOpcode::ReadConstBuffer ||
++			    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
++			    BufferAccessOf(op) != BufferAccess::None ||
++			    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
++				return true;
++			}
++			for (size_t index = 0; index < inst->NumArgs(); index++)
++				pending.push_back(inst->Arg(index));
++		}
++		return false;
++	}
++
++	// V3: a merged scalar buffer address may feed several BufferAtomic* sites
++	// (Ace Combat 8 CS 0x1d81bb2b74faf456: Phi -> BitwiseOr32 flag ->
++	// GetBufferResource -> 4x BufferAtomicOr32). Such a Phi qualifies for host
++	// Select lowering when it is a uniform diamond that is not inside a cycle and
++	// that no shader write can precede, so the host-evaluated descriptor reads
++	// observe the same memory as the GPU. Lane-dependent selection still fails.
++	void FindUniformAtomicDescriptorPhis() {
++		m_uniform_atomic_phis.clear();
++		std::set<const Inst*> rejected;
++		const auto write_free_prefix = [&](const Block* start) {
++			// Every block that can execute before 'start' (and 'start' itself).
++			std::vector<const Block*> pending {start};
++			std::set<const Block*> seen;
++			while (!pending.empty()) {
++				const auto* block = pending.back();
++				pending.pop_back();
++				if (!seen.insert(block).second) continue;
++				for (const auto& inst: *block)
++					if (WritesMemory(inst)) return false;
++				const auto preds = block->ImmPredecessors();
++				pending.insert(pending.end(), preds.begin(), preds.end());
++			}
++			return true;
++		};
++		for (const auto* block: m_program.blocks) {
++			for (const auto& inst: *block) {
++				if (inst.GetOpcode() != ValueOpcode::GetBufferResource) continue;
++				const bool atomic = std::ranges::any_of(inst.Uses(), [&](const Use& use) {
++					return use.user != nullptr && use.operand == 0u &&
++					       BufferAccessOf(use.user->GetOpcode()) == BufferAccess::Atomic;
++				});
++				if (!atomic) continue;
++				for (uint32_t word = 0; word < inst.NumArgs(); ++word) {
++				// V4 (#1224): any simple uniform expression over the Phi, not only Phi | imm.
++				for (const auto* phi: DescriptorWordPhis(inst.Arg(word))) {
++					if (m_uniform_atomic_phis.contains(phi) || rejected.contains(phi))
++						continue;
++					const Block* branch = nullptr;
++					std::array<const Block*, 2> targets {};
++					bool ok = UniformDescriptorDiamond(*phi, branch, targets);
++					const auto* merge = phi->Parent();
++					// Loops: the diamond must not be re-entered from its merge.
++					ok = ok && !Reaches(merge, branch);
++					// No write may execute before either incoming value is produced.
++					ok = ok && write_free_prefix(phi->PhiBlock(0)) &&
++					     write_free_prefix(phi->PhiBlock(1));
++					if (ok) m_uniform_atomic_phis.insert(phi);
++					else rejected.insert(phi);
++				}
++				}
++			}
++		}
++	}
++
++	Value LowerDescriptorPhi(Value value, bool terminal_store = false) {
++		value           = value.Resolve();
++		const auto* phi = value.TryInstruction();
++		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
++		    phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u || phi->GetType() != Type::U32) {
+ 			return value;
+ 		}
++		const Block* branch = nullptr;
++		std::array<const Block*, 2> targets {};
++		if (!UniformDescriptorDiamond(*phi, branch, targets)) {
++			return value;
++		}
++		// With shader writes, a host-evaluated selection is accepted when:
++		//  - V2: the descriptor feeds the sole terminal store, or
++		//  - V3: the Phi is a proven uniform, write-free, acyclic atomic diamond, or
++		//  - V4 (#1224): the branch condition reads no memory (user data and
++		//    constants only), so no shader write can change which arm is taken.
++		//    Diamonds inside a cycle are still rejected on this path.
++		if (m_shader_writes && !terminal_store && !m_uniform_atomic_phis.contains(phi) &&
++		    (ReadsMemory(branch->condition) || Reaches(phi->Parent(), branch))) {
++			return value;
++		}
++		for (const auto& [original, selected]: m_descriptor_selections) {
++			if (original == phi) {
++				return selected;
++			}
++		}
++		const auto& info = *branch;
++		const auto& term = info.terminator;
+ 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
+ 		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
+ 		auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+@@ -669,6 +860,46 @@ private:
+ 		return Value(&selected);
+ 	}
+ 
++	// V4 (#1224): lowers descriptor Phis nested in a uniform expression (S_BITSET1,
++	// shifts, adds, ... on a V# word selected by a scalar branch) by rebuilding the
++	// expression over the host selections in value_storage. GPU SSA is untouched.
++	Value LowerDescriptorWord(Value value, std::vector<std::pair<const Inst*, Value>>& lowered,
++	                          bool terminal_store, uint32_t depth = 0) {
++		value            = value.Resolve();
++		const auto* inst = value.TryInstruction();
++		if (inst == nullptr) {
++			return value;
++		}
++		if (inst->GetOpcode() == ValueOpcode::Phi) {
++			return LowerDescriptorPhi(value, terminal_store);
++		}
++		if (depth > 64u || !IsRuntimeUniformOp(inst->GetOpcode())) {
++			return value;
++		}
++		for (const auto& [original, result]: lowered) {
++			if (original == inst) {
++				return result;
++			}
++		}
++		std::vector<Value> args(inst->NumArgs());
++		bool               changed = false;
++		for (size_t index = 0; index < args.size(); index++) {
++			args[index] = LowerDescriptorWord(inst->Arg(index), lowered, terminal_store, depth + 1);
++			changed     = changed || args[index] != inst->Arg(index).Resolve();
++		}
++		auto result = value;
++		if (changed) {
++			auto& rebuilt = m_program.value_storage.emplace_back(inst->GetOpcode(),
++			                                                     inst->Flags<uint64_t>());
++			for (size_t index = 0; index < args.size(); index++) {
++				rebuilt.SetArg(index, args[index]);
++			}
++			result = Value(&rebuilt);
++		}
++		lowered.emplace_back(inst, result);
++		return result;
++	}
++
+ 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
+ 	                uint32_t base_reg, DescriptorSource& descriptor, uint32_t pc) {
+ 		const auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
+@@ -683,10 +914,12 @@ private:
+ 			                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
+ 		}
+ 		descriptor.dword_count = width;
++		std::vector<std::pair<const Inst*, Value>> lowered;
++		const bool terminal_store = &handle == m_terminal_store_handle;
+ 		for (uint32_t i = 0; i < width; i++) {
+ 			const auto value = base_reg != UINT32_MAX
+ 			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
+-			descriptor.dwords[i] = LowerDescriptorPhi(value);
++			descriptor.dwords[i] = LowerDescriptorWord(value, lowered, terminal_store);
+ 		}
+ 		if (sample_adjust) {
+ 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
+@@ -2263,12 +2496,25 @@ private:
+ 				source = indirect->source;
+ 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
+ 			               memory.resource * 4u, handle, source)) {
++				// Layer B: Layer A could not lower this V# to a bound buffer. In compute
++				// shaders, raw stores and 32-bit atomics write through BDA instead; the
++				// renderer settles the written pages after the dispatch (KYTY_BDA_WRITES).
++				if (buffer != BufferAccess::Read && memory.kind == ResourceKind::Buffer &&
++				    m_program.stage == ShaderType::Compute && BdaWritesEnabled() &&
++				    memory.SupportsIndirectRawWrite(op)) {
++					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
++					m_info.uses_dma                         = true;
++					m_info.bda_writes                       = true;
++					return;
++				}
+ 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+ 				                                                        : ResourceKind::Buffer) ||
+ 				    !memory.SupportsIndirectBufferLoad(op)) {
+-					Fail(flags.pc,
+-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
+-					     "requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
++					Fail(flags.pc, fmt::format(
++					    "buffer descriptor is not a valid runtime value; unsupported GPU-selected "
++					    "access: opcode={} bits={} dwords={} formatted={} typed={} kind={}",
++					    ValueOpcodeName(op), memory.data_bits, memory.data_dwords,
++					    memory.formatted, memory.typed, static_cast<unsigned>(memory.kind)));
+ 				}
+ 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+ 				m_info.uses_dma                         = true;
+@@ -2398,6 +2644,8 @@ private:
+ 	std::vector<MemoryPatch>                   m_memory_patches;
+ 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
+ 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
++	const Inst*                                m_terminal_store_handle = nullptr;
++	std::set<const Inst*>                      m_uniform_atomic_phis;
+ 	bool                                       m_shader_writes = false;
+ };
+ 
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index 12ecdfc..dbdedca 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -84,6 +84,8 @@ bool IsRuntimeSelect(ValueOpcode op) {
+ 	       op == ValueOpcode::SelectF32;
+ }
+ 
++} // namespace
++
+ bool IsRuntimeUniformOp(ValueOpcode op) {
+ 	switch (op) {
+ 		case ValueOpcode::ConditionRef:
+@@ -141,6 +143,8 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
+ 	}
+ }
+ 
++namespace {
++
+ class RuntimeValidator {
+ public:
+ 	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type)
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.h b/src/graphics/shader/recompiler/ir/passes/SrtWalker.h
+index 32a057c..70e9379 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.h
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.h
+@@ -31,6 +31,8 @@ enum class RuntimeValueType { Any, Integer };
+ 
+ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
+                           RuntimeValueType type = RuntimeValueType::Any);
++// Side-effect-free operations that runtime values may combine.
++bool IsRuntimeUniformOp(ValueOpcode op);
+ // Uses the strict reader for values that affect shader specialization.
+ SrtRuntime CleanRuntime(SrtRuntime runtime);
+ 
+diff --git a/tests/ResourceTrackingTests.cpp b/tests/ResourceTrackingTests.cpp
+index d82a18d..108edc0 100644
+--- a/tests/ResourceTrackingTests.cpp
++++ b/tests/ResourceTrackingTests.cpp
+@@ -1,4 +1,5 @@
+ #include "graphics/guest_gpu/gpu_defs.h"
++#include "graphics/shader/recompiler/ir/BdaWrites.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+ #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+ #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+@@ -2358,6 +2359,263 @@ void TestDynamicSrtReadRemainsExplicit() {
+         "dynamic scalar read received the wrong resource usage");
+ }
+ 
++// Models the uploaded shader's diamond, merged base address, and stride flag.
++ResourcePlan TerminalStorePlan(unsigned rejected_case = 0, bool memory_condition = false) {
++  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
++  Fixture f;
++  auto* entry = f.block;
++  auto* left = f.AddBlock();
++  auto* right = f.AddBlock();
++  auto* merge = f.AddBlock();
++  entry->AddBranch(left); entry->AddBranch(right);
++  left->AddBranch(merge); right->AddBranch(merge);
++  entry->terminator = {.kind=CFG::TerminatorKind::ConditionalBranch,
++                      .true_block=left, .false_block=right};
++  left->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=merge};
++  right->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=merge};
++  auto address = f.Address(Value(0x1000u), Value(0u));
++  auto read = [&](Block* block, uint32_t offset) {
++    MemoryInfo m; m.kind=ResourceKind::ScalarAddress; m.offset=offset;
++    return f.Emit(ValueOpcode::LoadAddressU32,
++        {address, Value(0u), Value(0u), Value(true)}, f.AddMemory(m, 0x10+offset), block);
++  };
++  // V4: memory_condition selects the arm with a scalar memory read (words[4])
++  // instead of user data; shader writes may then alias the predicate.
++  entry->condition = rejected_case == 1 ? f.Emit(ValueOpcode::ULessThan32,
++      {f.Emit(ValueOpcode::LaneId), Value(1u)}) :
++      f.Emit(ValueOpcode::INotEqual32,
++             {memory_condition ? read(entry, 16) : f.UserData(0), Value(0u)});
++  auto lo0=read(left,0), hi0=read(left,4);
++  auto lo1=read(right,8), hi1=read(right,12);
++  auto& lo=merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
++  lo.AddPhiOperand(left,lo0); lo.AddPhiOperand(right,lo1);
++  auto& hi=merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
++  hi.AddPhiOperand(left,hi0); hi.AddPhiOperand(right,hi1);
++  auto high=f.Emit(ValueOpcode::BitwiseOr32,{Value(&hi),Value(0x40000u)},0,merge);
++  auto handle=f.Emit(ValueOpcode::GetBufferResource,
++      {Value(&lo),high,Value(100u),Value(0x16204u)},MemoryFlags{0,0x84},merge);
++  MemoryInfo m; m.kind=ResourceKind::Buffer;
++  if (rejected_case == 2) {
++    auto prior=f.Buffer({Value(0x2000u),Value(0x40000u),Value(100u),Value(0x16204u)});
++    f.Emit(ValueOpcode::StoreBufferU32,
++        {prior,Value(0u),Value(0u),Value(0u),Value(0u),Value(true)},f.AddMemory(m,4),entry);
++  }
++  f.Emit(ValueOpcode::StoreBufferU32,
++      {handle,Value(4u),Value(0u),Value(0u),Value(0u),Value(true)},f.AddMemory(m,0x84),merge);
++  if (rejected_case == 3) {
++    merge->AddBranch(entry);
++    merge->terminator={.kind=CFG::TerminatorKind::Branch,.true_block=entry};
++  }
++  if (rejected_case == 4) read(merge,16);
++  f.PlanAndTrack();
++  Check(lo.GetOpcode()==ValueOpcode::Phi && hi.GetOpcode()==ValueOpcode::Phi &&
++        high.Instruction()->Arg(0).Instruction()==&hi,
++        "terminal store planning changed GPU SSA");
++  Check(f.program.info.buffers.size()==(rejected_case == 2 ? 2u : 1u) &&
++        f.program.info.buffers[handle.Instruction()->Flags<uint32_t>()].written,
++        "terminal store lost its writable buffer binding");
++  EliminateDeadCode(f.program.blocks);
++  ValidateProgram(f.program,true);
++  return ExtractResourcePlan(f.program);
++}
++
++void TestTerminalStoreDescriptorPhi() {
++  // V4 (#1224): a user-data predicate cannot observe shader writes, so a write
++  // before the diamond (2) or a read after the store (4) is now accepted too.
++  for (unsigned mode : {0u,2u,4u}) {
++  auto plan=TerminalStorePlan(mode);
++  TestMemory memory; memory.words={0x3000u,1u,0x4000u,2u};
++  for (uint32_t flag : {0u,1u}) {
++    std::array<uint32_t,64> user{}; user[0]=flag;
++    SrtRuntime runtime{.user_data=user,.read_memory=ReadTestMemory,.userdata=&memory,
++                       .read_specialization_memory=ReadTestMemory};
++    DescriptorValue value;
++    SrtWalker clean(plan,CleanRuntime(runtime));
++    // Mode 2 also binds the immediate 0x2000 buffer written before the diamond.
++    bool found = false;
++    for (const auto& buffer : plan.info.buffers) {
++      DescriptorValue candidate;
++      Check(SrtWalker(plan,runtime,&clean).EvaluateDescriptor(buffer.source,candidate),
++            "terminal store descriptor evaluation failed");
++      if (candidate.dwords[0] != 0x2000u) { value = candidate; found = true; }
++    }
++    Check(found, "terminal store descriptor missing");
++    Check(value.dwords[0]==(flag ? 0x3000u:0x4000u) &&
++          value.dwords[1]==((flag ? 1u:2u)|0x40000u),
++          "terminal store selected wrong base or lost stride flag");
++  }
++  }
++  // Sole terminal store with a memory predicate: V2 rule still accepts.
++  TerminalStorePlan(0, true);
++  for (unsigned mode : {1u,3u})
++    CheckFatal([&]{TerminalStorePlan(mode);},"not a valid runtime value",
++               "unsafe writable descriptor selection accepted");
++  // Memory predicate plus an earlier write: neither V2, V3 nor #1224 applies.
++  for (unsigned mode : {2u,4u})
++    CheckFatal([&]{TerminalStorePlan(mode, true);},"not a valid runtime value",
++               "memory-predicated writable descriptor selection accepted");
++}
++
++// V3: Ace Combat 8 CS 0x1d81bb2b74faf456 merges a scalar buffer address in a
++// uniform diamond, ORs a flag into the high word, and feeds several
++// BufferAtomicOr32 sites (plus unrelated stores) from the same Phi.
++// V4: expr 0 = hi | flag; 1 = (hi + 0x10) | flag; 2 = also lo << 4.
++ResourcePlan UniformAtomicPlan(unsigned rejected_case = 0,
++                               ValueOpcode atomic_op = ValueOpcode::BufferAtomicOr32,
++                               bool memory_condition = false, unsigned expr = 0) {
++  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
++  Fixture f;
++  auto* entry = f.block;
++  auto* left = f.AddBlock();
++  auto* right = f.AddBlock();
++  auto* merge = f.AddBlock();
++  auto* tail = f.AddBlock();
++  entry->AddBranch(left); entry->AddBranch(right);
++  left->AddBranch(merge); right->AddBranch(merge);
++  merge->AddBranch(tail);
++  entry->terminator = {.kind=CFG::TerminatorKind::ConditionalBranch,
++                      .true_block=left, .false_block=right};
++  left->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=merge};
++  right->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=merge};
++  merge->terminator = {.kind=CFG::TerminatorKind::Branch, .true_block=tail};
++  if (rejected_case == 4) {
++    // Write-free loop around the diamond; all writes happen after the loop exits.
++    merge->AddBranch(entry);
++    merge->terminator = {.kind=CFG::TerminatorKind::ConditionalBranch,
++                        .true_block=tail, .false_block=entry};
++    merge->condition = f.Emit(ValueOpcode::INotEqual32, {f.UserData(1), Value(0u)});
++  }
++  auto address = f.Address(Value(0x1000u), Value(0u));
++  auto read = [&](Block* block, uint32_t offset) {
++    MemoryInfo m; m.kind=ResourceKind::ScalarAddress; m.offset=offset;
++    return f.Emit(ValueOpcode::LoadAddressU32,
++        {address, Value(0u), Value(0u), Value(true)}, f.AddMemory(m, 0x10+offset), block);
++  };
++  // V4: memory_condition selects the arm with a scalar memory read (words[4])
++  // instead of user data; shader writes may then alias the predicate.
++  entry->condition = rejected_case == 1 ? f.Emit(ValueOpcode::ULessThan32,
++      {f.Emit(ValueOpcode::LaneId), Value(1u)}) :
++      f.Emit(ValueOpcode::INotEqual32,
++             {memory_condition ? read(entry, 16) : f.UserData(0), Value(0u)});
++  auto lo0=read(left,0), hi0=read(left,4);
++  auto lo1=read(right,8), hi1=read(right,12);
++  auto& lo=merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
++  lo.AddPhiOperand(left,lo0); lo.AddPhiOperand(right,lo1);
++  auto& hi=merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
++  hi.AddPhiOperand(left,hi0); hi.AddPhiOperand(right,hi1);
++  const auto high_input = expr >= 1u
++      ? f.Emit(ValueOpcode::IAdd32,{Value(&hi),Value(0x10u)},0,merge) : Value(&hi);
++  auto high=f.Emit(ValueOpcode::BitwiseOr32,{high_input,Value(0x40000u)},0,merge);
++  const auto low = expr == 2u
++      ? f.Emit(ValueOpcode::ShiftLeftLogical32,{Value(&lo),Value(4u)},0,merge) : Value(&lo);
