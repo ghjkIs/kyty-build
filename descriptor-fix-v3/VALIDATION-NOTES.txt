@@ -1,0 +1,52 @@
+KytyPS5 descriptor fix V3 - validation notes
+
+Patch: descriptor-v3.patch (cumulative vs 7b9997baea0d385e9e8fc2bd3abeb02110bc4148)
+SHA256: bbc01f37ce41f4a7c7f1e811ba769a987375402406d3aa07cbaae5d62f45e4bf
+Files: spirvEmitterMemory.cpp, Program.cpp, ShaderIR.h (V2, unchanged),
+       ResourceTracking.cpp (V2 + V3), tests/ResourceTrackingTests.cpp (V2 + V3)
+
+DONE HERE (Linux, GCC 14.2, C++20)
+- V2 patch (sha 978925d4...) applied cleanly to a fresh 7b9997b checkout; V3
+  edits were made on top and the cumulative diff was taken from the clean tree.
+- descriptor-v3.patch: `git apply --check`, `git apply`, `patch -p1 --dry-run`
+  and `git diff --check` all succeed on a fresh 7b9997b worktree.
+- The workflow embeds the patch as base64 like V2, but of the zlib-compressed
+  patch (20 KB workflow instead of 62 KB); SHA256 is checked on the
+  decompressed patch. The workflow's own Python apply step was executed
+  locally against a fresh worktree and produced the identical patch file.
+- Standalone resource_tracking_tests (same source list as CMake target) built
+  and passed in full: "resource tracking tests passed", including all V2 tests
+  (terminal store descriptor phi, expanded indirect reads, writable descriptor
+  phi, ...).
+
+NEW TEST: "uniform atomic descriptor phi" (TestUniformAtomicDescriptorPhi)
+Models CS 0x1d81bb2b74faf456: uniform diamond on user data, lo/hi address
+loads in each arm, hi Phi | 0x40000 flag, TWO GetBufferResource handles on the
+same Phis each feeding an atomic (one in the merge block, one in a later block),
+plus an unrelated straight-line StoreBufferU32 (a shape V2's sole-terminal-store
+rule rejects).
+Positive (run for BufferAtomicOr32 and BufferAtomicIAdd32):
+- PlanAndTrack succeeds; GPU Phi / BitwiseOr32 SSA unchanged.
+- Both atomic sites bind the SAME buffer, which is written+atomic+read; no
+  IndirectBuffer fallback; program validates after DCE.
+- Extracted resource plan evaluates to the correct base and keeps the 0x40000
+  flag for both branch directions (user data 0 and 1).
+Negative (must still fail with "not a valid runtime value"):
+- 1: LaneId-dependent branch condition (also checks the opcode=BufferAtomicOr32
+     diagnostic text is kept).
+- 2: a buffer write before the diamond (host-read descriptor could be stale).
+- 3: loop back-edge containing the atomics.
+- 4: write-free loop around the diamond (atomics only after the loop).
+Mutation checks: without V3 the new test fails with exactly the game's error
+("unsupported GPU-selected access: opcode=BufferAtomicOr32 ..."); removing the
+write-before check makes case 2 pass (test fails); removing the loop check
+makes case 4 pass (test fails).
+
+NOT DONE HERE
+- No Windows/MSVC/clang-cl build (the GitHub Actions run does that, and runs
+  the resource_tracking ctest).
+- No GPU run, no SPIR-V/Vulkan execution of the shader, no Ace Combat 8 run.
+  Real-game behaviour on the RTX 5070 Ti is unverified.
+- The real shader was checked by reading its IR dump only: its diamond
+  ($2 -> $3/$4 -> $5) is acyclic (all SCCs trivial) and has no writes before it,
+  so it should meet the V3 conditions, but this was not executed.
