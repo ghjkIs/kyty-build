@@ -1,0 +1,54 @@
+diff --git a/src/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp b/src/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp
+index 7c36ca0..62e3880 100644
+--- a/src/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp
++++ b/src/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp
+@@ -39,10 +39,10 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
+     {0x0bu, Opcode::V_MUL_U32_U24, Vop2SdwaProfile::IntegerPartialDestination},
+     {0x0fu, Opcode::V_MIN_F32},
+     {0x10u, Opcode::V_MAX_F32},
+-    {0x11u, Opcode::V_MIN_I32},
+-    {0x12u, Opcode::V_MAX_I32, Vop2SdwaProfile::IntegerFullDestination},
++    {0x11u, Opcode::V_MIN_I32, Vop2SdwaProfile::IntegerPartialDestination},
++    {0x12u, Opcode::V_MAX_I32, Vop2SdwaProfile::IntegerPartialDestination},
+     {0x13u, Opcode::V_MIN_U32, Vop2SdwaProfile::IntegerPartialDestination},
+-    {0x14u, Opcode::V_MAX_U32, Vop2SdwaProfile::IntegerFullDestination},
++    {0x14u, Opcode::V_MAX_U32, Vop2SdwaProfile::IntegerPartialDestination},
+     {0x15u, Opcode::V_LSHR_B32},
+     {0x16u, Opcode::V_LSHRREV_B32, Vop2SdwaProfile::ReverseRightShift},
+     {0x17u, Opcode::V_ASHR_I32},
+diff --git a/tests/shaderCfgTests.cpp b/tests/shaderCfgTests.cpp
+index f603117..e3bb6aa 100644
+--- a/tests/shaderCfgTests.cpp
++++ b/tests/shaderCfgTests.cpp
+@@ -2233,6 +2233,14 @@ void TestNewShaderRecompilerMoreAluFamilies() {
+       EncodeVop2Sdwa(5, 6, 0, 4, 6),
+       EncodeVop2(0x1b, 124, 249, 6),
+       EncodeVop2Sdwa(5, 6, 0, 4, 5),
++      0x22221cf9u,
++      0x03860611u, // v_min_i32 v17, s17, v14.byte3 (Ace Combat 8 pc 0x54c)
++      EncodeVop2(0x12, 18, 249, 6),
++      EncodeVop2Sdwa(5, 6, 0, 0, 6, 1), // v_max_i32 v18, sext(v5.byte0), v6
++      EncodeVop2(0x13, 19, 249, 6),
++      EncodeVop2Sdwa(5, 4, 2, 6, 5),    // v_min_u32 v19.lo, v5, v6.hi
++      EncodeVop2(0x14, 20, 249, 6),
++      EncodeVop2Sdwa(5, 6, 0, 1, 6),    // v_max_u32 v20, v5.byte1, v6
+       0x025e6af9u,
+       0x16060635u, // v_cndmask_b32 v47, v53, -v53
+       0x020e02f9u,
+@@ -2462,6 +2470,16 @@ void TestNewShaderRecompilerMoreAluFamilies() {
+       "new decoder did not decode VOP2 SDWA first source selector");
+   Check((result.decoded_dump.find("v6.sdwa(sel=5") != std::string::npos),
+         "new decoder did not decode VOP2 SDWA second source selector");
++  Check((result.decoded_dump.find("v_min_i32 v17,") != std::string::npos) &&
++            (result.decoded_dump.find("v14.sdwa(sel=3,sext=0)") != std::string::npos),
++        "new decoder did not decode V_MIN_I32 SDWA byte-3 source selector");
++  Check((result.decoded_dump.find("v_max_i32 v18, v5.sdwa(sel=0,sext=1)") != std::string::npos),
++        "new decoder did not decode V_MAX_I32 SDWA signed byte source selector");
++  Check((result.decoded_dump.find("v_min_u32 v19") != std::string::npos) &&
++            (result.decoded_dump.find("v_max_u32 v20, v5.sdwa(sel=1,sext=0)") != std::string::npos),
++        "new decoder did not decode unsigned min/max SDWA forms");
++  Check((result.decoded_dump.find("VOP2 SDWA modifier is not supported for opcode") == std::string::npos),
++        "integer min/max SDWA still rejected by decoder");
+   Check((result.decoded_dump.find("v_cndmask_b32 v47, v53,") != std::string::npos) &&
+             (result.decoded_dump.find("v53.neg") != std::string::npos),
+         "new decoder did not decode V_CNDMASK_B32 SDWA source modifier");
