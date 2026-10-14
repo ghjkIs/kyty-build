@@ -1,0 +1,37 @@
+diff --git a/src/libs/agc.cpp b/src/libs/agc.cpp
+index de431d4..30b74cf 100644
+--- a/src/libs/agc.cpp
++++ b/src/libs/agc.cpp
+@@ -3955,6 +3955,32 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
+ 	} else if (op == Pm4::IT_EVENT_WRITE_EOP) {
+ 		cmd[2] = static_cast<uint32_t>(vaddr & 0xffffffffu);
+ 		cmd[3] = (cmd[3] & 0xffff0000u) | static_cast<uint32_t>((vaddr >> 32u) & 0xffffu);
++	} else if (cmd[0] == 0u) {
++		// V8: the packet slot is still zero (header not yet emitted / reserved space).
++		// Nothing to patch: skip the memory write, keep the interrupt/fence semantics of
++		// whatever packet is written there later, and log once per unique site (rate limited).
++		static std::mutex             s_eop_zero_mutex;
++		static std::vector<uint64_t> s_eop_zero_sites;
++		static uint32_t               s_eop_zero_total = 0;
++		bool                          log_it           = false;
++		uint32_t                      total            = 0;
++		{
++			std::lock_guard<std::mutex> lock(s_eop_zero_mutex);
++			total = ++s_eop_zero_total;
++			auto site = reinterpret_cast<uint64_t>(cmd);
++			if (s_eop_zero_sites.size() < 64 &&
++			    std::find(s_eop_zero_sites.begin(), s_eop_zero_sites.end(), site) ==
++			        s_eop_zero_sites.end()) {
++				s_eop_zero_sites.push_back(site);
++				log_it = true;
++			}
++		}
++		if (log_it) {
++			LOGF("[V8] queueEndOfPipeAction address patch on zero packet ignored: cmd=0x%016" PRIx64
++			     " address=0x%016" PRIx64 " dw0..3=%08" PRIx32 " %08" PRIx32 " %08" PRIx32
++			     " %08" PRIx32 " total=%" PRIu32 "\n",
++			     reinterpret_cast<uint64_t>(cmd), vaddr, cmd[0], cmd[1], cmd[2], cmd[3], total);
++		}
+ 	} else {
+ 		EXIT("unsupported queueEndOfPipeAction packet for address patch: 0x%08" PRIx32 "\n",
+ 		     cmd[0]);

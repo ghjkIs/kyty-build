@@ -1,4 +1,4 @@
-name: Build KytyPS5 descriptor fix V7 (V6 + device-fault reporter + zeroed BDA table + GLC atomic-load knob) for Windows
+name: Build KytyPS5 descriptor fix V8 (V7 + zero-packet queueEndOfPipeAction address-patch no-op) for Windows
 
 on:
   workflow_dispatch:
@@ -20,13 +20,13 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Check out the V7 kit (this branch) for the patches
+      - name: Check out the V8 kit (this branch) for the patches
         uses: actions/checkout@v4
         with:
           path: kit
           persist-credentials: false
 
-      - name: Verify and apply the V5 cumulative patch + upstream PR 1194 + V7
+      - name: Verify and apply the V5 cumulative patch + upstream PR 1194 + V7 + V8
         shell: python
         run: |
           import hashlib, pathlib, subprocess
@@ -48,21 +48,27 @@ jobs:
           v7_expected = "e822e3ffd1a9f4a73ddfab45e535be5ae2f0e87b7d1b5d78a7c3b5e856ec02d8"
           v7 = pathlib.Path("kit/descriptor-fix-v7/v7-on-v6.patch").read_bytes().replace(b"\r\n", b"\n")
           assert hashlib.sha256(v7).hexdigest() == v7_expected, "V7 patch checksum mismatch"
-          for name, data in (("descriptor-v5.patch", v5), ("upstream-pr1194-srt-ordinary-reader.diff", pr), ("v7-on-v6.patch", v7)):
+          # 4) V8 on top of V7: AgcQueueEndOfPipeActionPatchAddress on an all-zero packet header is a
+          #    logged no-op (once per cmd address, max 64 sites) instead of EXIT (agc.cpp:3960).
+          v8_expected = "0d61586e5f72155e2780efa9aefdef7726984e4d7e9d29e6eaebe16eede92205"
+          v8 = pathlib.Path("kit/descriptor-fix-v8/v8-on-v7.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v8).hexdigest() == v8_expected, "V8 patch checksum mismatch"
+          for name, data in (("descriptor-v5.patch", v5), ("upstream-pr1194-srt-ordinary-reader.diff", pr), ("v7-on-v6.patch", v7), ("v8-on-v7.patch", v8)):
               path = pathlib.Path(name).resolve()
               path.write_bytes(data)
               subprocess.run(["git", "-C", "source", "apply", "--check", str(path)], check=True)
               subprocess.run(["git", "-C", "source", "apply", str(path)], check=True)
           subprocess.run(["git", "-C", "source", "diff", "--check"], check=True)
-          # Cumulative V7 patch (V5 + PR 1194 + V7) vs 7b9997b for provenance.
+          # Cumulative V8 patch (V5 + PR 1194 + V7 + V8) vs 7b9997b for provenance.
           subprocess.run(["git", "-C", "source", "add", "-A"], check=True)
           v7c = subprocess.check_output(["git", "-C", "source", "diff", "--cached"])
-          pathlib.Path("descriptor-v7-cumulative.patch").write_bytes(v7c)
+          pathlib.Path("descriptor-v8-cumulative.patch").write_bytes(v7c)
           shas = {
               "descriptor-v5.patch (parts 00..02 joined)": hashlib.sha256(v5).hexdigest(),
               "upstream-pr1194-srt-ordinary-reader.diff": hashlib.sha256(pr).hexdigest(),
               "v7-on-v6.patch": hashlib.sha256(v7).hexdigest(),
-              "descriptor-v7-cumulative.patch (generated)": hashlib.sha256(v7c).hexdigest(),
+              "v8-on-v7.patch": hashlib.sha256(v8).hexdigest(),
+              "descriptor-v8-cumulative.patch (generated)": hashlib.sha256(v7c).hexdigest(),
           }
           pathlib.Path("patch-shas.txt").write_text("".join(f"{v}  {k}\n" for k, v in shas.items()), encoding="utf-8")
           print(pathlib.Path("patch-shas.txt").read_text())
@@ -124,8 +130,10 @@ jobs:
           shutil.copy2("descriptor-v5.patch", install / "descriptor-v5.patch")
           shutil.copy2("upstream-pr1194-srt-ordinary-reader.diff", install / "upstream-pr1194-srt-ordinary-reader.diff")
           shutil.copy2("v7-on-v6.patch", install / "v7-on-v6.patch")
-          shutil.copy2("descriptor-v7-cumulative.patch", install / "descriptor-v7-cumulative.patch")
+          shutil.copy2("v8-on-v7.patch", install / "v8-on-v7.patch")
+          shutil.copy2("descriptor-v8-cumulative.patch", install / "descriptor-v8-cumulative.patch")
           shutil.copy2("kit/descriptor-fix-v7/README-V7.txt", install / "README-V7.txt")
+          shutil.copy2("kit/descriptor-fix-v8/README-V8.txt", install / "README-V8.txt")
           import os
           commit = os.environ.get("GITHUB_SHA", "unknown")
           ref = os.environ.get("GITHUB_REF_NAME", "unknown")
@@ -133,7 +141,7 @@ jobs:
           shutil.copy2("source/LICENSE", install / "LICENSE")
           shutil.copytree("source/LICENSES", install / "LICENSES", dirs_exist_ok=True)
           (install / "BUILD-INFO.txt").write_text(
-              "KytyPS5 descriptor fix V7 - EXPERIMENTAL DIAGNOSTIC BUILD.\n"
+              "KytyPS5 descriptor fix V8 - EXPERIMENTAL DIAGNOSTIC BUILD.\n"
               f"Kit branch: {ref}  kit commit: {commit}  Actions run: {run}\n"
               "Base: 7b9997baea0d385e9e8fc2bd3abeb02110bc4148 (no upstream-main rebase)\n"
               "Contents: V6 (= V4 Layer A + V4B Layer B + V5-B + upstream PR #1194 SRT ordinary reader)\n"
@@ -146,13 +154,14 @@ jobs:
               "   de6966b1 fault-buffer clear at creation (always on).\n"
               " + V7.3 AnyPS5 #2259 port: KYTY_GLC_ATOMIC_LOAD=1 (default OFF) makes coherent BDA dword\n"
               "   loads Device-scope atomic loads. #919 dwordx2 and bound-buffer coherent path DEFERRED.\n"
+              " + V8 AgcQueueEndOfPipeActionPatchAddress: zero packet header -> logged no-op ([V8] log line).\n"
               "NOT included: #1403, #986, #1138, #4279. Never set KYTY_BDA_WRITES=0.\n"
               "Ace Combat 8 (PPSA24913) patch version: REPORT 01.000.000 / 01.001.000 / 01.001.001.\n"
               "Patch SHA256s:\n" + pathlib.Path("patch-shas.txt").read_text(encoding="utf-8") +
               "Resource-tracking tests passed in this build.\n"
               "Upstream: https://github.com/KytyPS5/KytyPS5\n", encoding="utf-8")
-          (install / "Run-PPSA24913-Diagnostic-V7-R1.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V7-R1" --printf-direction File --printf-output-file "ace-combat-detail-v7-R1.txt" > "ace-combat-log-v7-R1.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
-          (install / "Run-PPSA24913-Diagnostic-V7-R2-GLC.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_GLC_ATOMIC_LOAD=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V7-R2" --printf-direction File --printf-output-file "ace-combat-detail-v7-R2.txt" > "ace-combat-log-v7-R2.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-Diagnostic-V8-R1.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V8-R1" --printf-direction File --printf-output-file "ace-combat-detail-v8-R1.txt" > "ace-combat-log-v8-R1.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-Diagnostic-V8-R2-GLC.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_GLC_ATOMIC_LOAD=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V8-R2" --printf-direction File --printf-output-file "ace-combat-detail-v8-R2.txt" > "ace-combat-log-v8-R2.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
           # Include the modified tracked source and the pinned submodule list for review.
           entries = subprocess.check_output(["git", "-C", "source", "ls-files", "--stage", "-z"]).decode().split("\0")
           with zipfile.ZipFile("patched-source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
@@ -168,13 +177,14 @@ jobs:
               archive.write("descriptor-v5.patch", "descriptor-v5.patch")
               archive.write("upstream-pr1194-srt-ordinary-reader.diff", "upstream-pr1194-srt-ordinary-reader.diff")
               archive.write("v7-on-v6.patch", "v7-on-v6.patch")
-              archive.write("descriptor-v7-cumulative.patch", "descriptor-v7-cumulative.patch")
+              archive.write("v8-on-v7.patch", "v8-on-v7.patch")
+              archive.write("descriptor-v8-cumulative.patch", "descriptor-v8-cumulative.patch")
               archive.write("patch-shas.txt", "patch-shas.txt")
 
       - name: Downloadable Windows executables
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Descriptor-Fix-V7-Windows-x64
+          name: KytyPS5-Descriptor-Fix-V8-Windows-x64
           path: install/
           if-no-files-found: error
           retention-days: 14
@@ -182,7 +192,7 @@ jobs:
       - name: Downloadable modified source
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Descriptor-Fix-V7-Source
+          name: KytyPS5-Descriptor-Fix-V8-Source
           path: patched-source.zip
           if-no-files-found: error
           retention-days: 14
@@ -191,7 +201,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Descriptor-Fix-V7-Diagnostics
+          name: KytyPS5-Descriptor-Fix-V8-Diagnostics
           path: |
             build/Testing/Temporary/LastTest.log
             build/CMakeFiles/CMakeConfigureLog.yaml
