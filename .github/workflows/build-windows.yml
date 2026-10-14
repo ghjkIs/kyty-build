@@ -1,4 +1,4 @@
-name: Build KytyPS5 descriptor fix V9 (V8 + VOP2 integer min/max SDWA) for Windows
+name: Build KytyPS5 descriptor fix V10 (V9 + host-side null-write guard) for Windows
 
 on:
   workflow_dispatch:
@@ -20,13 +20,13 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Check out the V9 kit (this branch) for the patches
+      - name: Check out the V10 kit (this branch) for the patches
         uses: actions/checkout@v4
         with:
           path: kit
           persist-credentials: false
 
-      - name: Verify and apply the V5 cumulative patch + upstream PR 1194 + V7 + V8 + V9
+      - name: Verify and apply the V5 cumulative patch + upstream PR 1194 + V7 + V8 + V9 + V10
         shell: python
         run: |
           import hashlib, pathlib, subprocess
@@ -57,23 +57,28 @@ jobs:
           v9_expected = "56848a7e58a04e35ac4a2087a1c89abff2772d1a552d0e92299c0728c2b3cea2"
           v9 = pathlib.Path("kit/descriptor-fix-v9/v9-on-v8.patch").read_bytes().replace(b"\r\n", b"\n")
           assert hashlib.sha256(v9).hexdigest() == v9_expected, "V9 patch checksum mismatch"
-          for name, data in (("descriptor-v5.patch", v5), ("upstream-pr1194-srt-ordinary-reader.diff", pr), ("v7-on-v6.patch", v7), ("v8-on-v7.patch", v8), ("v9-on-v8.patch", v9)):
+          # 6) V10 on top of V9: host-side null-write guard (KYTY_NULL_WRITE_GUARD, default on).
+          v10_expected = "52ce50272cbebc9bbddb41b072fd8280a60dd6f415b6c493d62d61e3d8626f22"
+          v10 = pathlib.Path("kit/descriptor-fix-v10/v10-on-v9.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v10).hexdigest() == v10_expected, "V10 patch checksum mismatch"
+          for name, data in (("descriptor-v5.patch", v5), ("upstream-pr1194-srt-ordinary-reader.diff", pr), ("v7-on-v6.patch", v7), ("v8-on-v7.patch", v8), ("v9-on-v8.patch", v9), ("v10-on-v9.patch", v10)):
               path = pathlib.Path(name).resolve()
               path.write_bytes(data)
               subprocess.run(["git", "-C", "source", "apply", "--check", str(path)], check=True)
               subprocess.run(["git", "-C", "source", "apply", str(path)], check=True)
           subprocess.run(["git", "-C", "source", "diff", "--check"], check=True)
-          # Cumulative V9 patch (V5 + PR 1194 + V7 + V8 + V9) vs 7b9997b for provenance.
+          # Cumulative V10 patch (V5 + PR 1194 + V7 + V8 + V9 + V10) vs 7b9997b for provenance.
           subprocess.run(["git", "-C", "source", "add", "-A"], check=True)
           v7c = subprocess.check_output(["git", "-C", "source", "diff", "--cached"])
-          pathlib.Path("descriptor-v9-cumulative.patch").write_bytes(v7c)
+          pathlib.Path("descriptor-v10-cumulative.patch").write_bytes(v7c)
           shas = {
               "descriptor-v5.patch (parts 00..02 joined)": hashlib.sha256(v5).hexdigest(),
               "upstream-pr1194-srt-ordinary-reader.diff": hashlib.sha256(pr).hexdigest(),
               "v7-on-v6.patch": hashlib.sha256(v7).hexdigest(),
               "v8-on-v7.patch": hashlib.sha256(v8).hexdigest(),
               "v9-on-v8.patch": hashlib.sha256(v9).hexdigest(),
-              "descriptor-v9-cumulative.patch (generated)": hashlib.sha256(v7c).hexdigest(),
+              "v10-on-v9.patch": hashlib.sha256(v10).hexdigest(),
+              "descriptor-v10-cumulative.patch (generated)": hashlib.sha256(v7c).hexdigest(),
           }
           pathlib.Path("patch-shas.txt").write_text("".join(f"{v}  {k}\n" for k, v in shas.items()), encoding="utf-8")
           print(pathlib.Path("patch-shas.txt").read_text())
@@ -137,10 +142,12 @@ jobs:
           shutil.copy2("v7-on-v6.patch", install / "v7-on-v6.patch")
           shutil.copy2("v8-on-v7.patch", install / "v8-on-v7.patch")
           shutil.copy2("v9-on-v8.patch", install / "v9-on-v8.patch")
-          shutil.copy2("descriptor-v9-cumulative.patch", install / "descriptor-v9-cumulative.patch")
+          shutil.copy2("v10-on-v9.patch", install / "v10-on-v9.patch")
+          shutil.copy2("descriptor-v10-cumulative.patch", install / "descriptor-v10-cumulative.patch")
           shutil.copy2("kit/descriptor-fix-v7/README-V7.txt", install / "README-V7.txt")
           shutil.copy2("kit/descriptor-fix-v8/README-V8.txt", install / "README-V8.txt")
           shutil.copy2("kit/descriptor-fix-v9/README-V9.txt", install / "README-V9.txt")
+          shutil.copy2("kit/descriptor-fix-v10/README-V10.txt", install / "README-V10.txt")
           import os
           commit = os.environ.get("GITHUB_SHA", "unknown")
           ref = os.environ.get("GITHUB_REF_NAME", "unknown")
@@ -148,7 +155,7 @@ jobs:
           shutil.copy2("source/LICENSE", install / "LICENSE")
           shutil.copytree("source/LICENSES", install / "LICENSES", dirs_exist_ok=True)
           (install / "BUILD-INFO.txt").write_text(
-              "KytyPS5 descriptor fix V9 - EXPERIMENTAL DIAGNOSTIC BUILD.\n"
+              "KytyPS5 descriptor fix V10 - EXPERIMENTAL DIAGNOSTIC BUILD.\n"
               f"Kit branch: {ref}  kit commit: {commit}  Actions run: {run}\n"
               "Base: 7b9997baea0d385e9e8fc2bd3abeb02110bc4148 (no upstream-main rebase)\n"
               "Contents: V6 (= V4 Layer A + V4B Layer B + V5-B + upstream PR #1194 SRT ordinary reader)\n"
@@ -165,13 +172,18 @@ jobs:
               " + V9 shader decoder: VOP2 V_MIN_I32 (0x11) accepts SDWA byte/word source selects\n"
               "   (sext honoured by the shared SDWA source reader); V_MAX_I32/V_MAX_U32 also allow\n"
               "   partial (byte/word) SDWA destinations like V_MIN_U32.\n"
+              " + V10 host-side null-write guard (KYTY_NULL_WRITE_GUARD, default ON, =0 disables):\n"
+              "   written buffer V#s with base 0 bind a 16 MiB device-local sink (not the 16-byte null\n"
+              "   buffer); written storage T#s with base 0 bind the 1x1 null storage image; cache buffers\n"
+              "   with device address 0 never publish BDA page-table entries. [V10] log once per\n"
+              "   (shader hash, slot).\n"
               "NOT included: #1403, #986, #1138, #4279. Never set KYTY_BDA_WRITES=0.\n"
               "Ace Combat 8 (PPSA24913) patch version: REPORT 01.000.000 / 01.001.000 / 01.001.001.\n"
               "Patch SHA256s:\n" + pathlib.Path("patch-shas.txt").read_text(encoding="utf-8") +
               "Resource-tracking tests passed in this build.\n"
               "Upstream: https://github.com/KytyPS5/KytyPS5\n", encoding="utf-8")
-          (install / "Run-PPSA24913-Diagnostic-V9-R1.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V9-R1" --printf-direction File --printf-output-file "ace-combat-detail-v9-R1.txt" > "ace-combat-log-v9-R1.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
-          (install / "Run-PPSA24913-Diagnostic-V9-R2-GLC.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_GLC_ATOMIC_LOAD=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V9-R2" --printf-direction File --printf-output-file "ace-combat-detail-v9-R2.txt" > "ace-combat-log-v9-R2.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-Diagnostic-V10-R1.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V10-R1" --printf-direction File --printf-output-file "ace-combat-detail-v10-R1.txt" > "ace-combat-log-v10-R1.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-Diagnostic-V10-R2-GLC.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_GLC_ATOMIC_LOAD=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V10-R2" --printf-direction File --printf-output-file "ace-combat-detail-v10-R2.txt" > "ace-combat-log-v10-R2.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
           # Include the modified tracked source and the pinned submodule list for review.
           entries = subprocess.check_output(["git", "-C", "source", "ls-files", "--stage", "-z"]).decode().split("\0")
           with zipfile.ZipFile("patched-source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
@@ -189,13 +201,14 @@ jobs:
               archive.write("v7-on-v6.patch", "v7-on-v6.patch")
               archive.write("v8-on-v7.patch", "v8-on-v7.patch")
               archive.write("v9-on-v8.patch", "v9-on-v8.patch")
-              archive.write("descriptor-v9-cumulative.patch", "descriptor-v9-cumulative.patch")
+              archive.write("v10-on-v9.patch", "v10-on-v9.patch")
+              archive.write("descriptor-v10-cumulative.patch", "descriptor-v10-cumulative.patch")
               archive.write("patch-shas.txt", "patch-shas.txt")
 
       - name: Downloadable Windows executables
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Descriptor-Fix-V9-Windows-x64
+          name: KytyPS5-Descriptor-Fix-V10-Windows-x64
           path: install/
           if-no-files-found: error
           retention-days: 14
@@ -203,7 +216,7 @@ jobs:
       - name: Downloadable modified source
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Descriptor-Fix-V9-Source
+          name: KytyPS5-Descriptor-Fix-V10-Source
           path: patched-source.zip
           if-no-files-found: error
           retention-days: 14
@@ -212,14 +225,14 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Descriptor-Fix-V9-Diagnostics
+          name: KytyPS5-Descriptor-Fix-V10-Diagnostics
           path: |
             build/Testing/Temporary/LastTest.log
             build/CMakeFiles/CMakeConfigureLog.yaml
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Optional V9 shader CFG regression tests (non-blocking)
+      - name: Optional shader CFG regression tests (non-blocking)
         if: success()
         continue-on-error: true
         shell: cmd
