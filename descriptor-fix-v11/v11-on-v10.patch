@@ -1,0 +1,332 @@
+diff --git a/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h b/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h
+index d390917..3c055ef 100644
+--- a/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h
++++ b/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h
+@@ -434,6 +434,27 @@ enum class Opcode {
+ 	V_CMPX_NLE_F16,
+ 	V_CMPX_NEQ_F16,
+ 	V_CMPX_NLT_F16,
++	V_CMP_F_F16,
++	V_CMP_O_F16,
++	V_CMP_U_F16,
++	V_CMP_NLG_F16,
++	V_CMP_NLE_F16,
++	V_CMP_TRU_F16,
++	V_CMPX_F_F16,
++	V_CMPX_LG_F16,
++	V_CMPX_O_F16,
++	V_CMPX_U_F16,
++	V_CMPX_NGE_F16,
++	V_CMPX_NLG_F16,
++	V_CMPX_TRU_F16,
++	V_CMPX_F_F32,
++	V_CMPX_TRU_F32,
++	V_CMPX_F_I32,
++	V_CMPX_T_I32,
++	V_CMPX_F_U32,
++	V_CMPX_T_U32,
++	V_CMPX_LE_U16,
++	V_CMPX_GE_U16,
+ 	V_CMPX_LT_I32,
+ 	V_CMPX_EQ_I32,
+ 	V_CMPX_LE_I32,
+diff --git a/src/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp b/src/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp
+index 62e3880..8ae2b2f 100644
+--- a/src/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp
++++ b/src/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp
+@@ -292,6 +292,18 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
+     {0xdeu, Opcode::V_CMPX_GE_F16},        {0xfbu, Opcode::V_CMPX_NGT_F16},
+     {0xfcu, Opcode::V_CMPX_NLE_F16},       {0xfdu, Opcode::V_CMPX_NEQ_F16},
+     {0xfeu, Opcode::V_CMPX_NLT_F16},
++    // V11: remaining RDNA2 VOPC compares (Ace Combat 8 pc 0x2400 is v_cmpx_nge_f16 SDWA).
++    {0xc8u, Opcode::V_CMP_F_F16},          {0xcfu, Opcode::V_CMP_O_F16},
++    {0xe8u, Opcode::V_CMP_U_F16},          {0xeau, Opcode::V_CMP_NLG_F16},
++    {0xecu, Opcode::V_CMP_NLE_F16},        {0xefu, Opcode::V_CMP_TRU_F16},
++    {0xd8u, Opcode::V_CMPX_F_F16},         {0xddu, Opcode::V_CMPX_LG_F16},
++    {0xdfu, Opcode::V_CMPX_O_F16},         {0xf8u, Opcode::V_CMPX_U_F16},
++    {0xf9u, Opcode::V_CMPX_NGE_F16},       {0xfau, Opcode::V_CMPX_NLG_F16},
++    {0xffu, Opcode::V_CMPX_TRU_F16},
++    {0x10u, Opcode::V_CMPX_F_F32},         {0x1fu, Opcode::V_CMPX_TRU_F32},
++    {0x90u, Opcode::V_CMPX_F_I32},         {0x97u, Opcode::V_CMPX_T_I32},
++    {0xd0u, Opcode::V_CMPX_F_U32},         {0xd7u, Opcode::V_CMPX_T_U32},
++    {0xbbu, Opcode::V_CMPX_LE_U16},        {0xbeu, Opcode::V_CMPX_GE_U16},
+ };
+ 
+ constexpr auto VOPC_OPS = Detail::MakeOpcodeTable<0x100>(VOPC_OPCODE_LIST);
+@@ -929,6 +941,21 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
+ 		case Opcode::V_CMPX_NLE_F16:
+ 		case Opcode::V_CMPX_NEQ_F16:
+ 		case Opcode::V_CMPX_NLT_F16:
++		case Opcode::V_CMP_F_F16:
++		case Opcode::V_CMP_O_F16:
++		case Opcode::V_CMP_U_F16:
++		case Opcode::V_CMP_NLG_F16:
++		case Opcode::V_CMP_NLE_F16:
++		case Opcode::V_CMP_TRU_F16:
++		case Opcode::V_CMPX_F_F16:
++		case Opcode::V_CMPX_LG_F16:
++		case Opcode::V_CMPX_O_F16:
++		case Opcode::V_CMPX_U_F16:
++		case Opcode::V_CMPX_NGE_F16:
++		case Opcode::V_CMPX_NLG_F16:
++		case Opcode::V_CMPX_TRU_F16:
++		case Opcode::V_CMPX_F_F32:
++		case Opcode::V_CMPX_TRU_F32:
+ 		case Opcode::V_CMP_CLASS_F32:
+ 		case Opcode::V_CMP_CLASS_F16:
+ 		case Opcode::V_CMPX_CLASS_F16:
+@@ -1201,11 +1228,48 @@ VopcSdwaFields DecodeVopcSdwaFields(uint32_t modifier) {
+ 	return fields;
+ }
+ 
++// SDWA exists for every 16/32-bit VOPC compare/class opcode; 64-bit compares have no SDWA form.
++bool IsVopc64BitCompare(Opcode opcode) {
++	switch (opcode) {
++		case Opcode::V_CMP_EQ_F64:
++		case Opcode::V_CMP_LE_F64:
++		case Opcode::V_CMPX_LE_F64:
++		case Opcode::V_CMPX_GE_F64:
++		case Opcode::V_CMP_F_I64:
++		case Opcode::V_CMP_LT_I64:
++		case Opcode::V_CMP_EQ_I64:
++		case Opcode::V_CMP_LE_I64:
++		case Opcode::V_CMP_NE_I64:
++		case Opcode::V_CMP_T_I64:
++		case Opcode::V_CMPX_F_I64:
++		case Opcode::V_CMPX_LT_I64:
++		case Opcode::V_CMPX_EQ_I64:
++		case Opcode::V_CMPX_LE_I64:
++		case Opcode::V_CMPX_NE_I64:
++		case Opcode::V_CMPX_T_I64:
++		case Opcode::V_CMP_F_U64:
++		case Opcode::V_CMP_LT_U64:
++		case Opcode::V_CMP_EQ_U64:
++		case Opcode::V_CMP_LE_U64:
++		case Opcode::V_CMP_GT_U64:
++		case Opcode::V_CMP_NE_U64:
++		case Opcode::V_CMP_GE_U64:
++		case Opcode::V_CMP_T_U64:
++		case Opcode::V_CMPX_F_U64:
++		case Opcode::V_CMPX_LT_U64:
++		case Opcode::V_CMPX_EQ_U64:
++		case Opcode::V_CMPX_LE_U64:
++		case Opcode::V_CMPX_GT_U64:
++		case Opcode::V_CMPX_NE_U64:
++		case Opcode::V_CMPX_GE_U64:
++		case Opcode::V_CMPX_T_U64: return true;
++		default: return false;
++	}
++}
++
+ bool SupportsVopcSdwa(Opcode opcode) {
+-	return opcode != Opcode::UNSUPPORTED && opcode != Opcode::V_CMP_NE_I64 &&
+-	       opcode != Opcode::V_CMP_EQ_F64 &&
+-	       opcode != Opcode::V_CMP_LE_F64 && opcode != Opcode::V_CMPX_LE_F64 &&
+-	       opcode != Opcode::V_CMPX_GE_F64;
++	return opcode != Opcode::UNSUPPORTED && opcode != Opcode::UNKNOWN &&
++	       !IsVopc64BitCompare(opcode);
+ }
+ 
+ void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+@@ -1217,6 +1281,10 @@ void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
+ 		SetUnsupported(inst, Family::VOPC, opcode, "VOPC SDWA selector is invalid");
+ 		return;
+ 	}
++	if (inst.opcode == Opcode::UNSUPPORTED) {
++		SetUnsupported(inst, Family::VOPC, opcode, "VOPC opcode is not implemented");
++		return;
++	}
+ 	if (!SupportsVopcSdwa(inst.opcode)) {
+ 		SetUnsupported(inst, Family::VOPC, opcode,
+ 		               "VOPC SDWA modifier is not supported for opcode");
+@@ -1600,7 +1668,22 @@ bool IsVopcCompareExec(Opcode opcode) {
+ 		case Opcode::V_CMPX_NGT_F16:
+ 		case Opcode::V_CMPX_NLE_F16:
+ 		case Opcode::V_CMPX_NEQ_F16:
+-		case Opcode::V_CMPX_NLT_F16: return true;
++		case Opcode::V_CMPX_NLT_F16:
++		case Opcode::V_CMPX_F_F16:
++		case Opcode::V_CMPX_LG_F16:
++		case Opcode::V_CMPX_O_F16:
++		case Opcode::V_CMPX_U_F16:
++		case Opcode::V_CMPX_NGE_F16:
++		case Opcode::V_CMPX_NLG_F16:
++		case Opcode::V_CMPX_TRU_F16:
++		case Opcode::V_CMPX_F_F32:
++		case Opcode::V_CMPX_TRU_F32:
++		case Opcode::V_CMPX_F_I32:
++		case Opcode::V_CMPX_T_I32:
++		case Opcode::V_CMPX_F_U32:
++		case Opcode::V_CMPX_T_U32:
++		case Opcode::V_CMPX_LE_U16:
++		case Opcode::V_CMPX_GE_U16: return true;
+ 		default: return false;
+ 	}
+ }
+diff --git a/src/graphics/shader/recompiler/frontend/translate/Compare.cpp b/src/graphics/shader/recompiler/frontend/translate/Compare.cpp
+index a2be702..d95bf21 100644
+--- a/src/graphics/shader/recompiler/frontend/translate/Compare.cpp
++++ b/src/graphics/shader/recompiler/frontend/translate/Compare.cpp
+@@ -65,9 +65,11 @@ void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpc
+ 	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs}, flags)), false, cmpx);
+ }
+ 
+-void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx) {
+-	const auto lhs       = IR::F32(ReadOperand(inst.src0, IR::Type::F32));
+-	const auto rhs       = IR::F32(ReadOperand(inst.src1, IR::Type::F32));
++void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx,
++                                         bool half) {
++	// F16 operands go through the 16-bit lane reader so SDWA/OP_SEL selection, abs and neg apply.
++	const auto lhs = half ? ReadF16AsF32(inst.src0) : IR::F32(ReadOperand(inst.src0, IR::Type::F32));
++	const auto rhs = half ? ReadF16AsF32(inst.src1) : IR::F32(ReadOperand(inst.src1, IR::Type::F32));
+ 	const auto unordered = ir.LogicalOr(IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {lhs})),
+ 	                                    IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {rhs})));
+ 	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false, cmpx);
+diff --git a/src/graphics/shader/recompiler/frontend/translate/Translator.h b/src/graphics/shader/recompiler/frontend/translate/Translator.h
+index 5d5b4f4..a3c0e2f 100644
+--- a/src/graphics/shader/recompiler/frontend/translate/Translator.h
++++ b/src/graphics/shader/recompiler/frontend/translate/Translator.h
+@@ -127,7 +127,8 @@ private:
+ 	                          bool signed_value, bool cmpx);
+ 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
+ 	                      bool cmpx);
+-	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx);
++	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx,
++	                             bool half = false);
+ 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx, bool half = false);
+ 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
+ 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
+diff --git a/src/graphics/shader/recompiler/frontend/translate/Vector.cpp b/src/graphics/shader/recompiler/frontend/translate/Vector.cpp
+index 059b947..277092f 100644
+--- a/src/graphics/shader/recompiler/frontend/translate/Vector.cpp
++++ b/src/graphics/shader/recompiler/frontend/translate/Vector.cpp
+@@ -368,6 +368,41 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
+ 		case O::V_CMPX_NLT_F16:
+ 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThanEqual32, true, true);
+ 			return;
++		case O::V_CMP_NLG_F16:
++			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordEqual32, true, false);
++			return;
++		case O::V_CMPX_NLG_F16:
++			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordEqual32, true, true);
++			return;
++		case O::V_CMP_NLE_F16:
++			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThan32, true, false);
++			return;
++		case O::V_CMPX_LG_F16:
++			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdNotEqual32, true, true);
++			return;
++		case O::V_CMPX_NGE_F16:
++			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThan32, true, true);
++			return;
++		case O::V_CMP_F_F16: EmitCompareConstant(inst, false, false, false); return;
++		case O::V_CMP_TRU_F16: EmitCompareConstant(inst, true, false, false); return;
++		case O::V_CMPX_F_F16: EmitCompareConstant(inst, false, false, true); return;
++		case O::V_CMPX_TRU_F16: EmitCompareConstant(inst, true, false, true); return;
++		case O::V_CMPX_F_F32: EmitCompareConstant(inst, false, false, true); return;
++		case O::V_CMPX_TRU_F32: EmitCompareConstant(inst, true, false, true); return;
++		case O::V_CMPX_F_I32:
++		case O::V_CMPX_F_U32: EmitCompareConstant(inst, false, false, true); return;
++		case O::V_CMPX_T_I32:
++		case O::V_CMPX_T_U32: EmitCompareConstant(inst, true, false, true); return;
++		case O::V_CMPX_LE_U16:
++			EmitInteger16Compare(inst, IR::ValueOpcode::ULessThanEqual32, false, true);
++			return;
++		case O::V_CMPX_GE_U16:
++			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThanEqual32, false, true);
++			return;
++		case O::V_CMP_O_F16: EmitFloatOrderedCompare(inst, true, false, true); return;
++		case O::V_CMP_U_F16: EmitFloatOrderedCompare(inst, false, false, true); return;
++		case O::V_CMPX_O_F16: EmitFloatOrderedCompare(inst, true, true, true); return;
++		case O::V_CMPX_U_F16: EmitFloatOrderedCompare(inst, false, true, true); return;
+ 		case O::V_CMP_O_F32: EmitFloatOrderedCompare(inst, true, false); return;
+ 		case O::V_CMP_U_F32: EmitFloatOrderedCompare(inst, false, false); return;
+ 		case O::V_CMPX_O_F32: EmitFloatOrderedCompare(inst, true, true); return;
+diff --git a/tests/shaderCfgTests.cpp b/tests/shaderCfgTests.cpp
+index e3bb6aa..2278029 100644
+--- a/tests/shaderCfgTests.cpp
++++ b/tests/shaderCfgTests.cpp
+@@ -14516,6 +14516,75 @@ void TestGraphicsPushConstantPlacement() {
+   CheckSpirvBinaryValidates(spill.spirv);
+ }
+ 
++// V11: VOPC SDWA compares. Ace Combat 8 (PPSA24913) failed at pc 0x2400 with
++// raw=[0x7df300f9 0x86060019]: VOPC op 0xf9 = V_CMPX_NGE_F16, src0=SDWA, vsrc1=0x80 with S1=1
++// (inline constant 0), SDWA src0=v25 (S0=0), src0/src1 sel=DWORD, no sext/neg/abs.
++// GFX10 CMPX writes EXEC only.
++std::string DecodeVopcSdwaForTest(uint32_t word0, uint32_t word1) {
++  const uint32_t words[] = {word0, word1};
++  ShaderRecompiler::Decoder::Instruction inst{};
++  ShaderRecompiler::Decoder::DecodeInstruction(std::span<const uint32_t>(words), 0, inst);
++  return ShaderRecompiler::Decoder::InstructionToString(inst);
++}
++
++void TestNewShaderRecompilerVopcSdwaV11() {
++  struct Case {
++    uint32_t word0;
++    uint32_t word1;
++    const char *expected;
++  };
++  const Case cases[] = {
++      // Captured Ace Combat 8 instruction.
++      {0x7df300f9u, 0x86060019u, "V_CMPX_NGE_F16 exec_lo, v25, 0"},
++      // v_cmpx_nge_f16 with signed byte1 src0 and low-word src1.
++      {EncodeVopc(0xf9, 249, 6), EncodeVopcSdwa(5, 0, 0, 1, 4, 1, 0),
++       "V_CMPX_NGE_F16 exec_lo, v5.sdwa(sel=1,sext=1), v6.sdwa(sel=4,sext=0)"},
++      // v_cmp_u_f16 high word, explicit SGPR-pair destination (SD=1, sdst=s20).
++      {EncodeVopc(0xe8, 249, 6), EncodeVopcSdwa(5, 20, 1, 5, 6),
++       "V_CMP_U_F16 s20, v5.sdwa(sel=5,sext=0), v6"},
++      // v_cmpx_le_u16 with scalar src0 (S0=1) byte0 and sign-extended byte1 src1.
++      {EncodeVopc(0xbb, 249, 6), EncodeVopcSdwa(3, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1),
++       "V_CMPX_LE_U16 exec_lo, s3.sdwa(sel=0,sext=0), v6.sdwa(sel=1,sext=1)"},
++      // v_cmp_lt_i32 sign-extended byte2 src0, SD=0 -> vcc.
++      {EncodeVopc(0x81, 249, 6), EncodeVopcSdwa(5, 0, 0, 2, 6, 1),
++       "V_CMP_LT_I32 vcc_lo, v5.sdwa(sel=2,sext=1), v6"},
++      // v_cmp_nlg_f16 with scalar src1 (S1=1).
++      {EncodeVopc(0xea, 249, 7), EncodeVopcSdwa(5, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 1),
++       "V_CMP_NLG_F16 vcc_lo, v5, s7"},
++  };
++  for (const auto &entry : cases) {
++    const auto text = DecodeVopcSdwaForTest(entry.word0, entry.word1);
++    Check(text.find(entry.expected) != std::string::npos,
++          ("V11 VOPC SDWA decode mismatch: got '" + text + "' expected '" +
++           entry.expected + "'")
++              .c_str());
++    Check(text.find("unsupported") == std::string::npos,
++          ("V11 VOPC SDWA still unsupported: " + text).c_str());
++  }
++  // 64-bit compares have no SDWA encoding and stay rejected.
++  const auto cmp64 = DecodeVopcSdwaForTest(EncodeVopc(0xa1, 249, 6), EncodeVopcSdwa(5));
++  Check(cmp64.find("VOPC SDWA modifier is not supported for opcode") != std::string::npos,
++        "V11 VOPC SDWA unexpectedly accepted a 64-bit compare");
++
++  // The captured instruction and siblings must also translate end to end.
++  const uint32_t shader[] = {
++      0x7df300f9u, 0x86060019u, // v_cmpx_nge_f16 exec, v25, 0 (SDWA)
++      EncodeVopc(0xe8, 249, 6), EncodeVopcSdwa(5, 20, 1, 5, 6),
++      EncodeVopc(0xbb, 249, 6), EncodeVopcSdwa(3, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1),
++      EncodeVopc(0xcf, 5 + 256, 6), // v_cmp_o_f16 v5, v6
++      EncodeVopc(0xff, 5 + 256, 6), // v_cmpx_tru_f16 v5, v6
++      0xbf810000u,                  // s_endpgm
++  };
++  auto options = MakeCompileOptions(ShaderType::Compute);
++  options.dump_ir = true;
++  auto result = RecompileForTest(shader, options);
++  Check(result.decoded_dump.find("V_CMPX_NGE_F16") != std::string::npos,
++        "V11 captured V_CMPX_NGE_F16 SDWA missing from decoded dump");
++  Check(result.decoded_dump.find("unsupported") == std::string::npos,
++        "V11 VOPC SDWA shader still contains unsupported instructions");
++  Check(!result.spirv.empty(), "V11 VOPC SDWA shader produced no SPIR-V");
++}
++
+ void TestNewShaderRecompilerUnsupportedMemoryDecode() {
+   const uint32_t mubuf_unknown[] = {EncodeMubuf0(0x7b), EncodeMubuf1(0, 0, 1),
+                                     0xbf810000u};
+@@ -15191,6 +15260,7 @@ int main() {
+   TestPixelProgramCacheBindingIdentity();
+   TestGraphicsPushConstantPlacement();
+   TestNewShaderRecompilerUnsupportedMemoryDecode();
++  TestNewShaderRecompilerVopcSdwaV11();
+ 
+   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
+ 
