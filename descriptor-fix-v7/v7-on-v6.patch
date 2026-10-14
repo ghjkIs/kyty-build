@@ -1,0 +1,735 @@
+diff --git a/src/graphics/host_gpu/diagnosticCheckpoints.cpp b/src/graphics/host_gpu/diagnosticCheckpoints.cpp
+new file mode 100644
+index 0000000..a0fe2c5
+--- /dev/null
++++ b/src/graphics/host_gpu/diagnosticCheckpoints.cpp
+@@ -0,0 +1,258 @@
++#include "graphics/host_gpu/vulkanCommon.h"
++
++#include "common/logging/log.h"
++#include "graphics/host_gpu/graphicContext.h"
++
++#include <array>
++#include <atomic>
++#include <cinttypes>
++#include <cstdio>
++#include <mutex>
++#include <vector>
++
++namespace Libs::Graphics {
++
++namespace {
++
++constexpr size_t CHECKPOINT_RING_SIZE = 1u << 16u;
++
++std::array<DiagnosticCheckpoint, CHECKPOINT_RING_SIZE> g_checkpoints {};
++std::atomic<uint64_t>                                  g_checkpoint_sequence {0};
++
++const char* OpName(uint32_t op) {
++	switch (op) {
++		case 0: return "DispatchDirect";
++		case 1: return "DrawIndex";
++		case 2: return "DrawIndexAuto";
++		case 3: return "EopWrite";
++		case 4: return "EopInterrupt";
++		case 5: return "EopWriteBack";
++		case 6: return "EopFlip";
++		case 7: return "EopWriteBackFlip";
++		case 8: return "EopOnlyFlip";
++		case 9: return "DispatchIndirect";
++		default: return "Unknown";
++	}
++}
++
++void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
++	std::printf("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64
++	            " hash=0x%016" PRIx64 "\n",
++	            stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id,
++	            checkpoint.arg0, checkpoint.arg1, checkpoint.arg2, checkpoint.arg3,
++	            checkpoint.arg4, checkpoint.shader_hash);
++	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 " hash=0x%016" PRIx64 "\n",
++	     stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id, checkpoint.arg0,
++	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4,
++	     checkpoint.shader_hash);
++}
++
++constexpr size_t DISPATCH_RING_SIZE = 256;
++constexpr size_t BINDING_RING_SIZE  = 1u << 14u;
++
++struct BindingRecord {
++	uint64_t address  = 0;
++	uint64_t size     = 0;
++	uint64_t sequence = 0;
++	uint32_t type     = 0;
++	bool     bind     = false;
++};
++
++std::mutex                                       g_dispatch_mutex;
++std::array<DispatchRecord, DISPATCH_RING_SIZE>   g_dispatches {};
++uint64_t                                         g_dispatch_sequence = 0;
++std::mutex                                       g_binding_mutex;
++std::array<BindingRecord, BINDING_RING_SIZE>     g_bindings {};
++uint64_t                                         g_binding_sequence = 0;
++
++bool IsWatchedShader(uint64_t addr) {
++	// Recurring Ace Combat 8 prefs culprits live at 0x1640xxxxxx
++	// (e.g. 0x16401e1e00 args=192,108,1,65 and 0x1640211e00 args=189,106,1,65).
++	return (addr >> 24u) == 0x1640u;
++}
++
++void PrintDispatch(const char* tag, const DispatchRecord& r) {
++	std::printf("  [%s] seq=%" PRIu64 " %s submit=%" PRIu64 " shader=0x%010" PRIx64
++	            " hash=0x%016" PRIx64 " groups=%u,%u,%u mode=0x%x args=0x%012" PRIx64
++	            " bda=%u bda_writes=%u glc=%u\n",
++	            tag, r.sequence, r.indirect ? "DispatchIndirect" : "DispatchDirect", r.submit_id,
++	            r.shader_addr, r.shader_hash, r.groups_x, r.groups_y, r.groups_z, r.mode,
++	            r.indirect_args, r.uses_bda ? 1u : 0u, r.bda_writes ? 1u : 0u,
++	            r.coherent ? 1u : 0u);
++	LOGF("  [%s] seq=%" PRIu64 " %s submit=%" PRIu64 " shader=0x%010" PRIx64
++	     " hash=0x%016" PRIx64 " groups=%u,%u,%u mode=0x%x args=0x%012" PRIx64
++	     " bda=%u bda_writes=%u glc=%u\n",
++	     tag, r.sequence, r.indirect ? "DispatchIndirect" : "DispatchDirect", r.submit_id,
++	     r.shader_addr, r.shader_hash, r.groups_x, r.groups_y, r.groups_z, r.mode, r.indirect_args,
++	     r.uses_bda ? 1u : 0u, r.bda_writes ? 1u : 0u, r.coherent ? 1u : 0u);
++}
++
++void MatchFaultAddress(uint64_t va, uint64_t precision) {
++	const uint64_t mask = precision > 1 ? ~(precision - 1) : ~uint64_t {0};
++	std::lock_guard<std::mutex>       lock(g_binding_mutex);
++	const uint64_t    total = g_binding_sequence;
++	const uint64_t    first = total > BINDING_RING_SIZE ? total - BINDING_RING_SIZE : 0;
++	uint32_t          hits  = 0;
++	for (uint64_t s = total; s > first && hits < 16; s--) {
++		const auto& b = g_bindings[(s - 1) % BINDING_RING_SIZE];
++		const uint64_t lo = b.address & mask;
++		const uint64_t hi = b.address + b.size;
++		if ((va & mask) >= lo && va < hi + (precision > 1 ? precision : 0)) {
++			std::printf("    fault VA 0x%016" PRIx64 " in %s seq=%" PRIu64 " [0x%016" PRIx64
++			            ", +0x%" PRIx64 ") type=%u\n",
++			            va, b.bind ? "BIND" : "UNBIND", b.sequence, b.address, b.size, b.type);
++			LOGF("    fault VA 0x%016" PRIx64 " in %s seq=%" PRIu64 " [0x%016" PRIx64
++			     ", +0x%" PRIx64 ") type=%u\n",
++			     va, b.bind ? "BIND" : "UNBIND", b.sequence, b.address, b.size, b.type);
++			hits++;
++		}
++	}
++	if (hits == 0) {
++		std::printf("    fault VA 0x%016" PRIx64 " matches no recorded bind/unbind (%" PRIu64
++		            " recorded)\n", va, total);
++		LOGF("    fault VA 0x%016" PRIx64 " matches no recorded bind/unbind (%" PRIu64
++		     " recorded)\n", va, total);
++	}
++}
++
++void DumpDispatchRing() {
++	std::lock_guard<std::mutex>       lock(g_dispatch_mutex);
++	const uint64_t    total = g_dispatch_sequence;
++	const uint64_t    first = total > DISPATCH_RING_SIZE ? total - DISPATCH_RING_SIZE : 0;
++	std::printf("--- Last %" PRIu64 " compute dispatches (of %" PRIu64 ") ---\n", total - first,
++	            total);
++	LOGF("--- Last %" PRIu64 " compute dispatches (of %" PRIu64 ") ---\n", total - first, total);
++	for (uint64_t s = first; s < total; s++) {
++		PrintDispatch("ring", g_dispatches[s % DISPATCH_RING_SIZE]);
++	}
++}
++
++}
++
++void RecordDispatch(const DispatchRecord& record) {
++	DispatchRecord copy = record;
++	{
++		std::lock_guard<std::mutex>       lock(g_dispatch_mutex);
++		copy.sequence = ++g_dispatch_sequence;
++		g_dispatches[copy.sequence % DISPATCH_RING_SIZE] = copy;
++	}
++	if (IsWatchedShader(copy.shader_addr)) {
++		PrintDispatch("watch-0x1640", copy);
++	}
++}
++
++void RecordAddressBinding(uint64_t address, uint64_t size, bool bind, uint32_t type) {
++	std::lock_guard<std::mutex>       lock(g_binding_mutex);
++	auto&             slot = g_bindings[g_binding_sequence % BINDING_RING_SIZE];
++	slot.address           = address;
++	slot.size              = size;
++	slot.bind              = bind;
++	slot.type              = type;
++	slot.sequence          = ++g_binding_sequence;
++}
++
++const DiagnosticCheckpoint* RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint) {
++	const auto sequence = g_checkpoint_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
++	auto&      slot     = g_checkpoints[sequence % CHECKPOINT_RING_SIZE];
++	slot                = checkpoint;
++	slot.sequence       = sequence;
++	return &slot;
++}
++
++static void DumpDeviceFault(GraphicContext& graphics) {
++	if (!graphics.device_fault_enabled) {
++		return;
++	}
++	vk::DeviceFaultCountsEXT counts {};
++	auto result = graphics.device.getFaultInfoEXT(&counts, nullptr);
++	if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
++		std::printf("--- Device fault: query failed: %s ---\n", vk::to_string(result).c_str());
++		return;
++	}
++	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
++	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
++	std::vector<uint8_t>                       binary(static_cast<size_t>(counts.vendorBinarySize));
++	vk::DeviceFaultInfoEXT                     info {};
++	info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
++	info.pVendorInfos  = vendors.empty() ? nullptr : vendors.data();
++	info.pVendorBinaryData = binary.empty() ? nullptr : binary.data();
++	result = graphics.device.getFaultInfoEXT(&counts, &info);
++	std::printf("--- Device fault (%s): \"%s\" addresses=%u vendor=%u binary=%" PRIu64 " ---\n",
++	            vk::to_string(result).c_str(), info.description.data(), counts.addressInfoCount,
++	            counts.vendorInfoCount, static_cast<uint64_t>(counts.vendorBinarySize));
++	LOGF("--- Device fault (%s): \"%s\" addresses=%u vendor=%u binary=%" PRIu64 " ---\n",
++	     vk::to_string(result).c_str(), info.description.data(), counts.addressInfoCount,
++	     counts.vendorInfoCount, static_cast<uint64_t>(counts.vendorBinarySize));
++	if (!binary.empty()) {
++		if (auto* file = std::fopen("_device_fault.nv-gpudmp", "wb"); file != nullptr) {
++			std::fwrite(binary.data(), 1, binary.size(), file);
++			std::fclose(file);
++			std::printf("  vendor binary written to _device_fault.nv-gpudmp\n");
++		}
++	}
++	for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
++		const auto& address = addresses[i];
++		std::printf("  address[%u]: %s at 0x%016" PRIx64 " (precision 0x%" PRIx64 ")\n", i,
++		            vk::to_string(address.addressType).c_str(),
++		            static_cast<uint64_t>(address.reportedAddress),
++		            static_cast<uint64_t>(address.addressPrecision));
++		LOGF("  address[%u]: %s at 0x%016" PRIx64 " (precision 0x%" PRIx64 ")\n", i,
++		     vk::to_string(address.addressType).c_str(),
++		     static_cast<uint64_t>(address.reportedAddress),
++		     static_cast<uint64_t>(address.addressPrecision));
++		if (graphics.address_binding_report_enabled) {
++			MatchFaultAddress(static_cast<uint64_t>(address.reportedAddress),
++			                  static_cast<uint64_t>(address.addressPrecision));
++		}
++	}
++	for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
++		const auto& vendor = vendors[i];
++		std::printf("  vendor[%u]: \"%s\" code=0x%016" PRIx64 " data=0x%016" PRIx64 "\n", i,
++		            vendor.description.data(), static_cast<uint64_t>(vendor.vendorFaultCode),
++		            static_cast<uint64_t>(vendor.vendorFaultData));
++		LOGF("  vendor[%u]: \"%s\" code=0x%016" PRIx64 " data=0x%016" PRIx64 "\n", i,
++		     vendor.description.data(), static_cast<uint64_t>(vendor.vendorFaultCode),
++		     static_cast<uint64_t>(vendor.vendorFaultData));
++	}
++	std::fflush(stdout);
++}
++
++void DumpDeviceLossDiagnostics(GraphicContext& graphics) {
++	static std::atomic<bool> dumped {false};
++	if (dumped.exchange(true)) {
++		return;
++	}
++	DumpDeviceFault(graphics);
++	DumpDispatchRing();
++	std::fflush(stdout);
++	if (!graphics.diagnostic_checkpoints_enabled || graphics.queue == nullptr) {
++		return;
++	}
++	std::vector<vk::CheckpointDataNV> data;
++	{
++		Common::LockGuard lock(graphics.queue_mutex);
++		data = graphics.queue.getCheckpointDataNV();
++	}
++	std::printf("--- Diagnostic checkpoints (%zu, last recorded seq=%" PRIu64 ") ---\n",
++	            data.size(), g_checkpoint_sequence.load(std::memory_order_relaxed));
++	LOGF("--- Diagnostic checkpoints (%zu, last recorded seq=%" PRIu64 ") ---\n", data.size(),
++	     g_checkpoint_sequence.load(std::memory_order_relaxed));
++	for (const auto& entry: data) {
++		const auto* checkpoint = static_cast<const DiagnosticCheckpoint*>(entry.pCheckpointMarker);
++		const auto  stage      = vk::to_string(entry.stage);
++		const bool  in_ring    = checkpoint >= g_checkpoints.data() &&
++		                      checkpoint < g_checkpoints.data() + g_checkpoints.size();
++		std::printf("  [%s] marker=%p ring=[%p, %p) %s\n", stage.c_str(),
++		            static_cast<const void*>(checkpoint),
++		            static_cast<const void*>(g_checkpoints.data()),
++		            static_cast<const void*>(g_checkpoints.data() + g_checkpoints.size()),
++		            in_ring ? "inside" : "OUTSIDE");
++		if (checkpoint == nullptr || !in_ring) {
++			continue;
++		}
++		Print(stage.c_str(), *checkpoint);
++	}
++	std::fflush(stdout);
++}
++
++}
+diff --git a/src/graphics/host_gpu/graphicContext.h b/src/graphics/host_gpu/graphicContext.h
+index d579eee..64e6fef 100644
+--- a/src/graphics/host_gpu/graphicContext.h
++++ b/src/graphics/host_gpu/graphicContext.h
+@@ -18,15 +18,56 @@ struct VulkanImage;
+ 
+ inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
+ 
++struct DiagnosticCheckpoint {
++	uint32_t op        = 0;
++	uint64_t submit_id = 0;
++	uint32_t arg0      = 0;
++	uint32_t arg1      = 0;
++	uint32_t arg2      = 0;
++	uint32_t arg3      = 0;
++	uint64_t arg4      = 0;
++	uint64_t sequence  = 0;
++	uint64_t shader_hash = 0;
++};
++
++// V7: last-N compute dispatch ring, dumped on DeviceLost.
++struct DispatchRecord {
++	uint64_t submit_id    = 0;
++	uint64_t shader_addr  = 0;
++	uint64_t shader_hash  = 0;
++	uint64_t indirect_args = 0;
++	uint32_t groups_x     = 0;
++	uint32_t groups_y     = 0;
++	uint32_t groups_z     = 0;
++	uint32_t mode         = 0;
++	bool     indirect     = false;
++	bool     uses_bda     = false;
++	bool     bda_writes   = false;
++	bool     coherent     = false;
++	uint64_t sequence     = 0;
++};
++
++struct GraphicContext;
++
++[[nodiscard]] const DiagnosticCheckpoint*
++RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
++void DumpDeviceLossDiagnostics(GraphicContext& graphics);
++void RecordDispatch(const DispatchRecord& record);
++void RecordAddressBinding(uint64_t address, uint64_t size, bool bind, uint32_t type);
++
+ struct GraphicContext {
+ 	vk::Instance                       instance                              = nullptr;
+ 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
++	vk::DebugUtilsMessengerEXT         address_binding_messenger             = nullptr;
+ 	vk::PhysicalDevice                 physical_device                       = nullptr;
+ 	vk::PhysicalDeviceProperties       physical_device_properties            = {};
+ 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};
+ 	vk::Device                         device                                = nullptr;
+ 	VmaAllocator                       allocator                             = nullptr;
+ 	bool                               memory_budget_ext_enabled             = false;
++	bool                               diagnostic_checkpoints_enabled        = false;
++	bool                               device_fault_enabled                  = false;
++	bool                               address_binding_report_enabled        = false;
+ 	bool                               compute_subgroup_size_control_enabled = false;
+ 	bool                               sample_rate_shading_enabled           = false;
+ 	bool                               shader_image_int64_atomics_enabled    = false;
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index 1d3ad41..19bf8d5 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -233,6 +233,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
+ 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+ 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
+ 	                     "BDA Page Table Buffer");
++	// A zero entry marks a page without a buffer, and device memory starts undefined.
++	m_bda_pagetable_buffer.Fill(m_scheduler.BeginCommand(), 0, m_bda_pagetable_buffer.Size(), 0);
++	m_scheduler.Submit();
+ 	const auto null_id =
+ 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
+ 	EXIT_IF(null_id != NULL_BUFFER_ID);
+diff --git a/src/graphics/host_gpu/renderer/cache/faultManager.cpp b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+index 05a97c4..2ed580b 100644
+--- a/src/graphics/host_gpu/renderer/cache/faultManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+@@ -87,6 +87,11 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
+ 	RequireVulkanSuccess(result, "create fault-buffer pipeline");
+ 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
+ 
++	// Device memory starts undefined, and the parser reports every set bit. The renderer is
++	// created before guest commands bind the scheduler, so the clear has its own submission.
++	m_fault_buffer.Fill(m_scheduler.BeginCommand(), 0, m_fault_buffer.Size(), 0);
++	m_scheduler.Submit();
++
+ 	if (m_bda_writes) {
+ 		const auto bda_module = CompileSPV(BDA_WRITE_PROCESS_SPV, m_graphics.device);
+ 		pipeline_info.stage.module = bda_module;
+diff --git a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+index b0fc5fb..a5ec692 100644
+--- a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
++++ b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+@@ -195,10 +195,13 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
+ }
+ 
+ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
++	Fill(Scheduler().Current(), offset, size, value);
++}
++
++void Buffer::Fill(CommandBuffer& command, uint64_t offset, uint64_t size, uint32_t value) {
+ 	if (((offset | size) & 3u) != 0) {
+ 		EXIT("Buffer: fill range must be dword aligned\n");
+ 	}
+-	auto& command = Scheduler().Current();
+ 	command.EndRendering();
+ 	const auto before =
+ 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+diff --git a/src/graphics/host_gpu/renderer/cache/streamBuffer.h b/src/graphics/host_gpu/renderer/cache/streamBuffer.h
+index 9e89048..8702812 100644
+--- a/src/graphics/host_gpu/renderer/cache/streamBuffer.h
++++ b/src/graphics/host_gpu/renderer/cache/streamBuffer.h
+@@ -67,6 +67,7 @@ public:
+ 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
+ 	                                                   vk::AccessFlagBits::eMemoryWrite);
+ 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
++	void               Fill(CommandBuffer& command, uint64_t offset, uint64_t size, uint32_t value);
+ 
+ 	// BufferCache state lives directly on the resource.
+ 	bool   is_deleted   = false;
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index 81e9215..d074e21 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -373,6 +373,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+ 		result = graphics.queue.submit(1, &submit_info, nullptr);
+ 	}
+ 
++	if (result == vk::Result::eErrorDeviceLost) {
++		DumpDeviceLossDiagnostics(graphics);
++	}
+ 	if (result != vk::Result::eSuccess) {
+ 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
+ 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
+diff --git a/src/graphics/host_gpu/renderer/context.cpp b/src/graphics/host_gpu/renderer/context.cpp
+index d71929f..45c924c 100644
+--- a/src/graphics/host_gpu/renderer/context.cpp
++++ b/src/graphics/host_gpu/renderer/context.cpp
+@@ -58,6 +58,18 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
+ 	m_debug_arg2      = arg2;
+ 	m_debug_arg3      = arg3;
+ 	m_debug_arg4      = arg4;
++	if (m_graphics.diagnostic_checkpoints_enabled && m_buffer) {
++		const auto* marker = RecordDiagnosticCheckpoint({.op        = op,
++		                                                 .submit_id = submit_id,
++		                                                 .arg0      = arg0,
++		                                                 .arg1      = arg1,
++		                                                 .arg2      = arg2,
++		                                                 .arg3      = arg3,
++		                                                 .arg4      = arg4});
++		if (marker != nullptr) {
++			Handle().setCheckpointNV(marker);
++		}
++	}
+ }
+ 
+ void CommandBuffer::BeginRendering(const RenderState& state) const {
+diff --git a/src/graphics/host_gpu/renderer/masterSemaphore.cpp b/src/graphics/host_gpu/renderer/masterSemaphore.cpp
+index 7a79187..7e7fea2 100644
+--- a/src/graphics/host_gpu/renderer/masterSemaphore.cpp
++++ b/src/graphics/host_gpu/renderer/masterSemaphore.cpp
+@@ -1,5 +1,7 @@
+ #include "graphics/host_gpu/renderer/masterSemaphore.h"
+ 
++#include <cinttypes>
++
+ #include "common/assert.h"
+ #include "graphics/host_gpu/graphicContext.h"
+ 
+@@ -50,7 +52,13 @@ void MasterSemaphore::Wait(uint64_t tick) {
+ 	wait_info.pValues        = &tick;
+ 
+ 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
++	if (result != vk::Result::eSuccess) {
++		if (result == vk::Result::eErrorDeviceLost) {
++			DumpDeviceLossDiagnostics(m_graphics);
++		}
++		EXIT("MasterSemaphore: wait for tick %" PRIu64 " failed: %s (gpu tick %" PRIu64 ")\n", tick,
++		     vk::to_string(result).c_str(), m_gpu_tick.load(std::memory_order_acquire));
++	}
+ 	Refresh();
+ }
+ 
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index de3e2d5..eb9d97b 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -433,6 +433,36 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	}
+ 
+ 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
++	{
++		DispatchRecord record {};
++		record.submit_id     = submit_id;
++		record.shader_addr   = buffer.GetShaders().GetCs().cs_regs.data_addr;
++		record.shader_hash   = program.shader_hash;
++		record.indirect_args = 0;
++		record.groups_x      = thread_group_x;
++		record.groups_y      = thread_group_y;
++		record.groups_z      = thread_group_z;
++		record.mode          = mode;
++		record.indirect      = false;
++		record.uses_bda      = program.info.uses_dma;
++		record.bda_writes    = program.info.bda_writes;
++		record.coherent      = program.info.coherent_buffers;
++		RecordDispatch(record);
++		if (m_context.GetGraphics().diagnostic_checkpoints_enabled) {
++			DiagnosticCheckpoint cp {};
++			cp.op          = static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect);
++			cp.submit_id   = submit_id;
++			cp.arg0        = record.groups_x;
++			cp.arg1        = record.groups_y;
++			cp.arg2        = record.groups_z;
++			cp.arg3        = mode;
++			cp.arg4        = record.shader_addr;
++			cp.shader_hash = record.shader_hash;
++			if (const auto* marker = RecordDiagnosticCheckpoint(cp); marker != nullptr) {
++				vk_buffer.setCheckpointNV(marker);
++			}
++		}
++	}
+ 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+ 
+ 	// The removed host fence also ordered read-only dispatches before later writers.
+@@ -502,6 +532,36 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
+ 	                          1, &barrier, 0, nullptr, 0, nullptr);
+ 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
++	{
++		DispatchRecord record {};
++		record.submit_id     = submit_id;
++		record.shader_addr   = buffer.GetShaders().GetCs().cs_regs.data_addr;
++		record.shader_hash   = program.shader_hash;
++		record.indirect_args = args_addr;
++		record.groups_x      = 0;
++		record.groups_y      = 0;
++		record.groups_z      = 0;
++		record.mode          = mode;
++		record.indirect      = true;
++		record.uses_bda      = program.info.uses_dma;
++		record.bda_writes    = program.info.bda_writes;
++		record.coherent      = program.info.coherent_buffers;
++		RecordDispatch(record);
++		if (m_context.GetGraphics().diagnostic_checkpoints_enabled) {
++			DiagnosticCheckpoint cp {};
++			cp.op          = static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect);
++			cp.submit_id   = submit_id;
++			cp.arg0        = record.groups_x;
++			cp.arg1        = record.groups_y;
++			cp.arg2        = record.groups_z;
++			cp.arg3        = mode;
++			cp.arg4        = record.shader_addr;
++			cp.shader_hash = record.shader_hash;
++			if (const auto* marker = RecordDiagnosticCheckpoint(cp); marker != nullptr) {
++				vk_buffer.setCheckpointNV(marker);
++			}
++		}
++	}
+ 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+ 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+ 	ResetBindings();
+diff --git a/src/graphics/presentation/window/vulkanWindow.cpp b/src/graphics/presentation/window/vulkanWindow.cpp
+index ab03572..2a31df0 100644
+--- a/src/graphics/presentation/window/vulkanWindow.cpp
++++ b/src/graphics/presentation/window/vulkanWindow.cpp
+@@ -638,6 +638,55 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
+ 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
+ 		create_info.pNext = &image_atomic_int64;
+ 	}
++	vk::DeviceDiagnosticsConfigCreateInfoNV       diagnostics_config {};
++	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
++	if (HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
++		vk::PhysicalDeviceDiagnosticsConfigFeaturesNV supported_diagnostics {};
++		vk::PhysicalDeviceFeatures2                   diagnostics_query {};
++		diagnostics_query.pNext = &supported_diagnostics;
++		physical_device.getFeatures2(&diagnostics_query);
++		if (supported_diagnostics.diagnosticsConfig) {
++			diagnostics_config.flags =
++			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
++			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
++			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting;
++			diagnostics_features.diagnosticsConfig = VK_TRUE;
++			diagnostics_features.pNext             = const_cast<void*>(create_info.pNext);
++			diagnostics_config.pNext               = &diagnostics_features;
++			create_info.pNext                      = &diagnostics_config;
++		}
++	}
++	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
++	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
++		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
++		vk::PhysicalDeviceFeatures2        fault_query {};
++		fault_query.pNext = &supported_fault;
++		physical_device.getFeatures2(&fault_query);
++		if (supported_fault.deviceFault) {
++			device_fault.deviceFault      = VK_TRUE;
++			device_fault.pNext            = const_cast<void*>(create_info.pNext);
++			create_info.pNext             = &device_fault;
++			graphics.device_fault_enabled = true;
++		}
++	}
++	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding {};
++	if (HasExtension(device_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
++		vk::PhysicalDeviceAddressBindingReportFeaturesEXT supported_binding {};
++		vk::PhysicalDeviceFeatures2                       binding_query {};
++		binding_query.pNext = &supported_binding;
++		physical_device.getFeatures2(&binding_query);
++		if (supported_binding.reportAddressBinding) {
++			address_binding.reportAddressBinding    = VK_TRUE;
++			address_binding.pNext                   = const_cast<void*>(create_info.pNext);
++			create_info.pNext                       = &address_binding;
++			graphics.address_binding_report_enabled = true;
++		}
++	}
++	LOGF("Vulkan diag: device_fault=%s nv_checkpoints=%s nv_diag_config=%s address_binding_report=%s\n",
++	     graphics.device_fault_enabled ? "on" : "off",
++	     graphics.diagnostic_checkpoints_enabled ? "on" : "off",
++	     diagnostics_features.diagnosticsConfig == VK_TRUE ? "on" : "off",
++	     graphics.address_binding_report_enabled ? "on" : "off");
+ 	create_info.pQueueCreateInfos       = &queue_create_info;
+ 	create_info.queueCreateInfoCount    = 1;
+ 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
+@@ -730,6 +779,27 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
+ 	}
+ }
+ 
++static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanAddressBindingCallback(
++    vk::DebugUtilsMessageSeverityFlagBitsEXT /*message_severity*/,
++    vk::DebugUtilsMessageTypeFlagsEXT             message_types,
++    const vk::DebugUtilsMessengerCallbackDataEXT* callback_data, void* /*user_data*/) {
++	if (callback_data == nullptr ||
++	    !(message_types & vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding)) {
++		return VK_FALSE;
++	}
++	for (const auto* next = static_cast<const vk::BaseInStructure*>(callback_data->pNext);
++	     next != nullptr; next = next->pNext) {
++		if (next->sType == vk::StructureType::eDeviceAddressBindingCallbackDataEXT) {
++			const auto* data = reinterpret_cast<const vk::DeviceAddressBindingCallbackDataEXT*>(next);
++			RecordAddressBinding(static_cast<uint64_t>(data->baseAddress),
++			                     static_cast<uint64_t>(data->size),
++			                     data->bindingType == vk::DeviceAddressBindingTypeEXT::eBind,
++			                     static_cast<uint32_t>(VkDeviceAddressBindingFlagsEXT(data->flags)));
++		}
++	}
++	return VK_FALSE;
++}
++
+ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
+     vk::DebugUtilsMessageSeverityFlagBitsEXT      message_severity,
+     vk::DebugUtilsMessageTypeFlagsEXT             message_types,
+@@ -1001,6 +1071,20 @@ void WindowContext::CreateVulkan() {
+ 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+ 			graphic_ctx.memory_budget_ext_enabled = true;
+ 		}
++		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
++			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
++			graphic_ctx.diagnostic_checkpoints_enabled = true;
++		}
++		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
++			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
++		}
++		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
++			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
++		}
++		if (HasExtension(available_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME) &&
++		    VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDebugUtilsMessengerEXT != nullptr) {
++			device_extensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
++		}
+ 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+ 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+ 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+@@ -1023,6 +1107,23 @@ void WindowContext::CreateVulkan() {
+ 		EXIT("Could not create device");
+ 	}
+ 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
++	if (graphic_ctx.address_binding_report_enabled &&
++	    VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDebugUtilsMessengerEXT != nullptr) {
++		vk::DebugUtilsMessengerCreateInfoEXT binding_info {};
++		binding_info.messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose |
++		                               vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
++		                               vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
++		                               vk::DebugUtilsMessageSeverityFlagBitsEXT::eError;
++		binding_info.messageType     = vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding;
++		binding_info.pfnUserCallback = VulkanAddressBindingCallback;
++		if (graphic_ctx.instance.createDebugUtilsMessengerEXT(
++		        &binding_info, nullptr, &graphic_ctx.address_binding_messenger) !=
++		    vk::Result::eSuccess) {
++			graphic_ctx.address_binding_messenger      = nullptr;
++			graphic_ctx.address_binding_report_enabled = false;
++			LOGF("Vulkan diag: address binding messenger unavailable\n");
++		}
++	}
+ 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
+ 	EXIT_IF(graphic_ctx.queue == nullptr);
+ 
+@@ -1071,6 +1172,11 @@ WindowContext::~WindowContext() {
+ 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
+ 		surface = nullptr;
+ 	}
++	if (graphic_ctx.address_binding_messenger != nullptr) {
++		graphic_ctx.instance.destroyDebugUtilsMessengerEXT(graphic_ctx.address_binding_messenger,
++		                                                   nullptr);
++		graphic_ctx.address_binding_messenger = nullptr;
++	}
+ 	if (graphic_ctx.debug_messenger != nullptr) {
+ 		graphic_ctx.instance.destroyDebugUtilsMessengerEXT(graphic_ctx.debug_messenger, nullptr);
+ 		graphic_ctx.debug_messenger = nullptr;
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+index e49335f..3a8e21c 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+@@ -3,6 +3,7 @@
+ #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+ #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+ #include "graphics/shader/recompiler/ir/BdaWrites.h"
++#include "graphics/shader/recompiler/ir/GlcAtomicLoad.h"
+ 
+ #include <algorithm>
+ #include <bit>
+@@ -188,6 +189,17 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
+ 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+ 	return EmitValueOrZeroIfCondition(state, present, [&]() {
+ 		auto pointer = state.builder.AllocateId();
++		if (coherent && IR::GlcAtomicLoadEnabled()) {
++			// V7 (#2259): the address is dword aligned by every caller; a Device-scope relaxed
++			// atomic load makes the glc read observe other workgroups' stores on NVIDIA.
++			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
++			                          bda);
++			const auto value = state.builder.AllocateId();
++			state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer,
++			                          ConstantU32(state, spv::ScopeDevice),
++			                          ConstantU32(state, spv::MemorySemanticsMaskNone));
++			return value;
++		}
+ 		if (coherent) {
+ 			const auto block = state.builder.DecoratedType(
+ 			    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+diff --git a/src/graphics/shader/recompiler/ir/GlcAtomicLoad.h b/src/graphics/shader/recompiler/ir/GlcAtomicLoad.h
+new file mode 100644
+index 0000000..399905a
+--- /dev/null
++++ b/src/graphics/shader/recompiler/ir/GlcAtomicLoad.h
+@@ -0,0 +1,26 @@
++#ifndef EMULATOR_SRC_GRAPHICS_SHADER_RECOMPILER_IR_GLCATOMICLOAD_H_
++#define EMULATOR_SRC_GRAPHICS_SHADER_RECOMPILER_IR_GLCATOMICLOAD_H_
++
++// Descriptor fix V7 (AnyPS5 #2259 port): KYTY_GLC_ATOMIC_LOAD=1 emits coherent (glc/dlc) aligned
++// BDA dword loads as Device-scope relaxed OpAtomicLoad instead of Volatile OpLoad.
++// Default OFF. Read once per process (there is no on-disk shader cache to invalidate).
++// Never bitcasts to uvec2 (NVIDIA compiler crash).
++
++#include <cstdlib>
++#include <cstring>
++
++namespace Libs::Graphics::ShaderRecompiler::IR {
++
++inline bool GlcAtomicLoadEnabled() {
++	static const bool enabled = [] {
++		const char* value = std::getenv("KYTY_GLC_ATOMIC_LOAD");
++		return value != nullptr &&
++		       (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0 ||
++		        std::strcmp(value, "ON") == 0 || std::strcmp(value, "true") == 0);
++	}();
++	return enabled;
++}
++
++} // namespace Libs::Graphics::ShaderRecompiler::IR
++
++#endif /* EMULATOR_SRC_GRAPHICS_SHADER_RECOMPILER_IR_GLCATOMICLOAD_H_ */
