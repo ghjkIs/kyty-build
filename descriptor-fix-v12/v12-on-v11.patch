@@ -1,0 +1,225 @@
+diff --git a/src/graphics/guest_gpu/command_processor/commandProcessor.h b/src/graphics/guest_gpu/command_processor/commandProcessor.h
+index c976bd8..d4d607b 100644
+--- a/src/graphics/guest_gpu/command_processor/commandProcessor.h
++++ b/src/graphics/guest_gpu/command_processor/commandProcessor.h
+@@ -105,6 +105,9 @@ public:
+ 	void PrepareCpuFlip(uint64_t request_id);
+ 	void SynchronizeGpu();
+ 	void EmitGlobalBarrier();
++	void DebugSyncBeforeDispatch();
++	void DebugSyncAfterDispatch();
++	void DebugSyncBeforeDraw();
+ 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+ 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
+ 	                    uint32_t mode);
+@@ -182,6 +185,7 @@ private:
+ 	FlipInfo  m_flip;
+ 	const int m_interrupt_event_id;
+ 	uint64_t  m_submit_id                   = 0;
++	bool      m_debug_sync_after_dispatch   = false;
+ 	uint64_t  m_synthetic_occlusion_counter = 0;
+ 	bool      m_predicate_skip              = false;
+ };
+diff --git a/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp b/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
+index f059a0a..50424aa 100644
+--- a/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
++++ b/src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
+@@ -6,6 +6,7 @@
+ #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+ #include "graphics/guest_gpu/graphicsRun.h"
+ #include "graphics/host_gpu/graphicContext.h"
++#include "graphics/host_gpu/renderer/debugSync.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/presentation/videoOut.h"
+@@ -1305,6 +1306,11 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
+ 	KYTY_PROFILER_FUNCTION();
+ 
+ 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
++	// V12: ACQUIRE_MEM (cache invalidate/writeback + wait) was a no-op, so guest-ordered
++	// compute->compute / compute->draw / host->GPU hand-offs had no Vulkan dependency.
++	if (AcquireMemBarrierEnabled()) {
++		cp.EmitGlobalBarrier();
++	}
+ 	return (cmd_id == 0xc0061050 ? 7 : 6);
+ }
+ 
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 3b83153..66bc73b 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -13,6 +13,7 @@
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/renderer/sync.h"
++#include "graphics/host_gpu/renderer/debugSync.h"
+ #include "graphics/presentation/videoOut.h"
+ #include "graphics/presentation/window.h"
+ #include "graphics/shader/shader.h"
+@@ -848,7 +849,33 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t
+ 	}
+ }
+ 
++void CommandProcessor::DebugSyncBeforeDispatch() {
++	// V12 KYTY_SYNC_COMPUTE=2: order back-to-back dispatches.
++	if (DebugSyncComputeMode() == 2 && m_debug_sync_after_dispatch) {
++		EmitGlobalBarrier();
++	}
++	m_debug_sync_after_dispatch = false;
++}
++
++void CommandProcessor::DebugSyncAfterDispatch() {
++	const int mode = DebugSyncComputeMode();
++	if (mode == 1) {
++		EmitGlobalBarrier();
++	} else if (mode == 2) {
++		m_debug_sync_after_dispatch = true;
++	}
++}
++
++void CommandProcessor::DebugSyncBeforeDraw() {
++	const int mode = DebugSyncComputeMode();
++	if (mode == 1 || (mode == 2 && m_debug_sync_after_dispatch)) {
++		EmitGlobalBarrier();
++	}
++	m_debug_sync_after_dispatch = false;
++}
++
+ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
++	DebugSyncBeforeDraw();
+ 	args.index_type_and_size = m_index_type_and_size;
+ 	if (args.instance_count == 0) {
+ 		args.instance_count = m_num_instances;
+@@ -1002,8 +1029,10 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
+ 			}
+ 		}
+ 
++		DebugSyncBeforeDispatch();
+ 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+ 		                                              thread_group_y, thread_group_z, mode);
++		DebugSyncAfterDispatch();
+ 	}
+ }
+ 
+@@ -1015,13 +1044,16 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+ 		return;
+ 	}
+ 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
++	DebugSyncBeforeDispatch();
+ 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
++	DebugSyncAfterDispatch();
+ }
+ 
+ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+ 	if (args.instance_count == 0) {
+ 		args.instance_count = m_num_instances;
+ 	}
++	DebugSyncBeforeDraw();
+ 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+ }
+ 
+diff --git a/src/graphics/host_gpu/renderer/cache/faultManager.cpp b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+index 2ed580b..5ada20e 100644
+--- a/src/graphics/host_gpu/renderer/cache/faultManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+@@ -7,6 +7,7 @@
+ #include "graphics/host_gpu/graphicContext.h"
+ #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+ #include "graphics/host_gpu/renderer/commandScheduler.h"
++#include "graphics/host_gpu/renderer/debugSync.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+ #include "graphics/shader/recompiler/ir/BdaWrites.h"
+ 
+@@ -92,6 +93,16 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
+ 	m_fault_buffer.Fill(m_scheduler.BeginCommand(), 0, m_fault_buffer.Size(), 0);
+ 	m_scheduler.Submit();
+ 
++	Log::WriteToConsoleAndLog(
++	    fmt::format("GPU: V12 sync debug: KYTY_SYNC_COMPUTE={} ({}), KYTY_SYNC_SUBMIT={}, "
++	                "ACQUIRE_MEM barrier={} (KYTY_ACQUIRE_MEM_BARRIER)\n",
++	                DebugSyncComputeMode(),
++	                DebugSyncComputeMode() == 1   ? "barrier after every dispatch and before every draw"
++	                : DebugSyncComputeMode() == 2 ? "barrier after dispatch when followed by dispatch/draw"
++	                                              : "off",
++	                DebugSyncSubmit() ? 1 : 0, AcquireMemBarrierEnabled() ? "on" : "off")
++	        .c_str());
++
+ 	if (m_bda_writes) {
+ 		const auto bda_module = CompileSPV(BDA_WRITE_PROCESS_SPV, m_graphics.device);
+ 		pipeline_info.stage.module = bda_module;
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index d074e21..d929a08 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -3,6 +3,7 @@
+ #include "common/assert.h"
+ #include "common/logging/log.h"
+ #include "graphics/host_gpu/graphicContext.h"
++#include "graphics/host_gpu/renderer/debugSync.h"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -371,6 +372,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+ 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+ 
+ 		result = graphics.queue.submit(1, &submit_info, nullptr);
++		// V12 KYTY_SYNC_SUBMIT=1: serialize host and GPU by waiting for every submit.
++		if (result == vk::Result::eSuccess && DebugSyncSubmit()) {
++			result = graphics.queue.waitIdle();
++		}
+ 	}
+ 
+ 	if (result == vk::Result::eErrorDeviceLost) {
+diff --git a/src/graphics/host_gpu/renderer/debugSync.h b/src/graphics/host_gpu/renderer/debugSync.h
+new file mode 100644
+index 0000000..148d9d3
+--- /dev/null
++++ b/src/graphics/host_gpu/renderer/debugSync.h
+@@ -0,0 +1,47 @@
++#ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEBUGSYNC_H_
++#define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEBUGSYNC_H_
++
++// Descriptor fix V12: debug synchronization switches (default off). Read once per process.
++//
++// KYTY_SYNC_COMPUTE:
++//   unset / "0" - off (default)
++//   "1"         - full memory barrier (all commands, memory write -> memory read/write, which
++//                 includes indirect-command reads) after every compute dispatch and before every
++//                 draw
++//   "2"         - lighter: barrier only after a dispatch that is followed by another dispatch
++//                 or a draw (no draw->draw barriers)
++// KYTY_SYNC_SUBMIT=1: wait for every queue submit to complete (queue waitIdle) before continuing.
++// KYTY_ACQUIRE_MEM_BARRIER (default on): V12 maps guest ACQUIRE_MEM to a global barrier;
++//   "0" restores the pre-V12 no-op.
++
++#include <cstdlib>
++#include <cstring>
++
++namespace Libs::Graphics {
++
++inline int DebugSyncEnvInt(const char* name, int def) {
++	const char* v = std::getenv(name);
++	if (v == nullptr || v[0] == '\0') return def;
++	if (std::strcmp(v, "off") == 0 || std::strcmp(v, "false") == 0) return 0;
++	if (std::strcmp(v, "on") == 0 || std::strcmp(v, "true") == 0) return 1;
++	return std::atoi(v);
++}
++
++inline int DebugSyncComputeMode() {
++	static const int mode = DebugSyncEnvInt("KYTY_SYNC_COMPUTE", 0);
++	return mode;
++}
++
++inline bool DebugSyncSubmit() {
++	static const bool on = DebugSyncEnvInt("KYTY_SYNC_SUBMIT", 0) != 0;
++	return on;
++}
++
++inline bool AcquireMemBarrierEnabled() {
++	static const bool on = DebugSyncEnvInt("KYTY_ACQUIRE_MEM_BARRIER", 1) != 0;
++	return on;
++}
++
++} // namespace Libs::Graphics
++
++#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEBUGSYNC_H_
