@@ -1,0 +1,530 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index 89e73757..7c01bbd6 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -11,11 +11,17 @@
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
++#include "graphics/host_gpu/renderer/image/imageInfo.h"
+ #include "kernel/memory.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+ #include <cinttypes>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <set>
++#include <tuple>
+ #include <cstring>
+ #include <memory>
+ #include <utility>
+@@ -28,6 +34,159 @@ namespace {
+ constexpr uint64_t MiB           = 1024 * 1024;
+ constexpr uint64_t GdsBufferSize = 64 * 1024;
+ 
++std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
++                                        StreamBuffer& staging, uint64_t size, uint64_t alignment,
++                                        vk::BufferUsageFlags usage, const auto& write) {
++	const auto [mapped, offset] = staging.Map(size, alignment);
++	if (mapped != nullptr) {
++		write(mapped, offset);
++		staging.Commit();
++		return {&staging, offset};
++	}
++
++	// Large transfers use the same one-time host allocation as ordinary buffer uploads.
++	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
++	                                         usage, size);
++	write(temporary->Mapped().data(), 0);
++	temporary->Flush(0, size);
++	auto* buffer = temporary.get();
++	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
++	return {buffer, 0};
++}
++
++// V13: tolerant guest reads. A read of guest memory that the backing store cannot serve
++// (outside the guest address space, or spanning a mapping the sparse reader rejects) used to
++// EXIT. Like upstream PR #1194 ("read unmapped shader resource memory as zero"), the range is
++// now read page by page: pages the backing (or a resident private mapping) can serve keep their
++// bytes, unreadable pages are zero-filled, and emulation continues. KYTY_ZERO_UNMAPPED_IMAGE=0
++// ("off"/"false") restores the old EXIT.
++constexpr uint64_t V13ReadPage = 0x4000;
++
++bool V13ZeroUnmappedEnabled() {
++	static const bool enabled = [] {
++		const char* value = std::getenv("KYTY_ZERO_UNMAPPED_IMAGE");
++		const bool  on    = value == nullptr ||
++		                !(std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0 ||
++		                  std::strcmp(value, "OFF") == 0 || std::strcmp(value, "false") == 0);
++		LOGF("[V13] zero-fill unreadable guest image/buffer backing %s (KYTY_ZERO_UNMAPPED_IMAGE=%s)\n",
++		     on ? "ON" : "OFF", value != nullptr ? value : "<unset>");
++		return on;
++	}();
++	return enabled;
++}
++
++// Once per unique (address, size, kind); at most 512 distinct sites, then one summary line.
++bool V13FirstSighting(uint64_t vaddr, uint64_t size, int kind) {
++	static std::mutex                                     mutex;
++	static std::set<std::tuple<uint64_t, uint64_t, int>> seen;
++	static bool                                           capped = false;
++	std::scoped_lock                                      lock {mutex};
++	if (seen.size() >= 512) {
++		if (!capped) {
++			capped = true;
++			LOGF("[V13] unreadable-backing log cap (512 sites) reached; further sites are silent\n");
++		}
++		return false;
++	}
++	return seen.emplace(vaddr, size, kind).second;
++}
++
++std::atomic<uint64_t> g_v13_zero_filled_reads {0};
++
++struct V13ReadResult {
++	uint64_t unreadable_bytes = 0;
++	uint64_t first_bad        = 0;
++	uint64_t last_bad_end     = 0;
++	uint32_t bad_runs         = 0;
++	char     runs[512]        = {};
++};
++
++// Reads [vaddr, vaddr + size) page by page; unreadable pages become zero.
++V13ReadResult V13ReadTolerant(uint64_t vaddr, uint8_t* destination, uint64_t size) {
++	V13ReadResult result;
++	size_t        used    = 0;
++	uint64_t      run_beg = 0;
++	bool          in_run  = false;
++	const auto    flush   = [&](uint64_t run_end) {
++		if (used < sizeof(result.runs) - 48) {
++			const int n = std::snprintf(result.runs + used, sizeof(result.runs) - used,
++			                            "%s[+0x%" PRIx64 ",+0x%" PRIx64 ")", used ? " " : "",
++			                            run_beg - vaddr, run_end - vaddr);
++			used += n > 0 ? static_cast<size_t>(n) : 0;
++		}
++		result.bad_runs++;
++	};
++	for (uint64_t cursor = vaddr; cursor < vaddr + size;) {
++		const auto next  = std::min(vaddr + size, (cursor & ~(V13ReadPage - 1)) + V13ReadPage);
++		const auto bytes = next - cursor;
++		auto*      out   = destination + (cursor - vaddr);
++		const bool ok    = LibKernel::Memory::TryReadSparseBacking(cursor, out, bytes) ||
++		                LibKernel::Memory::CopySparseMemory(cursor, out, bytes);
++		if (!ok) {
++			std::memset(out, 0, bytes);
++			if (result.unreadable_bytes == 0) {
++				result.first_bad = cursor;
++			}
++			result.unreadable_bytes += bytes;
++			result.last_bad_end = next;
++			if (!in_run) {
++				in_run  = true;
++				run_beg = cursor;
++			}
++		} else if (in_run) {
++			in_run = false;
++			flush(cursor);
++		}
++		cursor = next;
++	}
++	if (in_run) {
++		flush(vaddr + size);
++	}
++	return result;
++}
++
++// Reads guest memory for an upload; on failure falls back to V13ReadTolerant (logged) or EXITs.
++void V13ReadGuest(uint64_t vaddr, uint8_t* destination, uint64_t size, bool image_read,
++                  const char* caller, const ImageInfo* info) {
++	const bool ok = image_read ? LibKernel::Memory::TryReadSparseBacking(vaddr, destination, size)
++	                           : LibKernel::Memory::CopySparseMemory(vaddr, destination, size);
++	if (ok) {
++		return;
++	}
++	if (!V13ZeroUnmappedEnabled()) {
++		if (image_read) {
++			EXIT("BufferCache: failed to read mapped guest image backing\n");
++		}
++		EXIT("BufferCache: failed to read sparse guest buffer memory\n");
++	}
++	const auto result = V13ReadTolerant(vaddr, destination, size);
++	const auto total  = g_v13_zero_filled_reads.fetch_add(1) + 1;
++	if (!V13FirstSighting(vaddr, size, image_read ? 1 : 0)) {
++		return;
++	}
++	LOGF("[V13] unreadable guest %s backing zero-filled: caller=%s addr=0x%016" PRIx64
++	     " size=0x%" PRIx64 " unreadable=0x%" PRIx64 " (%s) runs=%u first_bad=0x%016" PRIx64
++	     " last_bad_end=0x%016" PRIx64 " pages(0x%" PRIx64 ")=%s gpu_mapped=%d total_events=%" PRIu64
++	     "\n",
++	     image_read ? "image" : "buffer", caller != nullptr ? caller : "?", vaddr, size,
++	     result.unreadable_bytes,
++	     result.unreadable_bytes == 0 ? "page reads succeeded" :
++	     result.unreadable_bytes == size ? "whole range" : "partial",
++	     result.bad_runs, result.first_bad, result.last_bad_end, V13ReadPage,
++	     result.runs[0] != 0 ? result.runs : "-",
++	     LibKernel::Memory::IsGpuMapped(vaddr, size) ? 1 : 0, total);
++	if (info != nullptr) {
++		LOGF("[V13]   image: guest_format=%u vk_format=%d type=%u tile_mode=%u extent=%ux%ux%u "
++		     "pitch=%u bytes_per_block=%u samples=%u stencil=0x%016" PRIx64 "+0x%" PRIx64
++		     " metadata_kind=%d\n",
++		     static_cast<uint32_t>(info->guest_format), static_cast<int>(info->pixel_format),
++		     static_cast<uint32_t>(info->type), static_cast<uint32_t>(info->tile_mode),
++		     info->extent.width, info->extent.height, info->extent.depth, info->pitch,
++		     info->bytes_per_block, info->samples, info->stencil.address, info->stencil.size,
++		     static_cast<int>(info->metadata.kind));
++	}
++}
++
+ } // namespace
+ 
+ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
+@@ -466,28 +625,16 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 		return nullptr;
+ 	}
+ 
+-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+-	if (mapped != nullptr) {
++	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
++	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
+ 		for (auto& copy: copies) {
+ 			const auto address = buffer.CpuAddress() + copy.dstOffset;
+-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
++			V13ReadGuest(address, mapped + copy.srcOffset, copy.size, false,
++			             "BufferCache::UploadCopies", nullptr);
+ 			copy.srcOffset += base_offset;
+ 		}
+-		m_staging_buffer.Commit();
+-		return m_staging_buffer.Handle();
+-	}
+-
+-	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+-	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+-	for (const auto& copy: copies) {
+-		const auto address = buffer.CpuAddress() + copy.dstOffset;
+-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
+-		            reinterpret_cast<const void*>(address), copy.size);
+-	}
+-	temporary->Flush(0, total_size);
+-	const auto handle = temporary->Handle();
+-	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+-	return handle;
++	});
++	return source.first->Handle();
+ }
+ 
+ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
+@@ -505,7 +652,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t
+ 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+ 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+ 		if (mapped != nullptr) {
+-			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
++			V13ReadGuest(vaddr, mapped, size, false, "BufferCache::ObtainBuffer(stream)", nullptr);
+ 			m_stream_buffer.Commit();
+ 			return {&m_stream_buffer, offset};
+ 		}
+@@ -523,7 +670,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t
+ 	return {&buffer, buffer.Offset(vaddr)};
+ }
+ 
+-std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
++std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size,
++                                                               const char*      caller,
++                                                               const ImageInfo* info) {
+ 	if (!GuestRange {vaddr, size}.Valid()) {
+ 		EXIT("BufferCache: invalid image source\n");
+ 	}
+@@ -540,12 +689,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
+ 		return ObtainBuffer(vaddr, size, false, false);
+ 	}
+ 
+-	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
+-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+-	}
+-	m_staging_buffer.Commit();
+-	return {&m_staging_buffer, stage_offset};
++	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
++	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
++	    [&](uint8_t* mapped, uint64_t) {
++		V13ReadGuest(vaddr, mapped, size, true, caller != nullptr ? caller : "ObtainBufferForImage",
++		             info);
++	});
+ }
+ 
+ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index a9ec6be2..6673243f 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -21,6 +21,7 @@ namespace Libs::Graphics {
+ struct GraphicContext;
+ class CommandScheduler;
+ class TextureCache;
++struct ImageInfo;
+ 
+ using BufferId = Common::SlotId;
+ inline constexpr BufferId NULL_BUFFER_ID {0};
+@@ -74,7 +75,8 @@ public:
+ 	[[nodiscard]] Buffer& GetNullWriteBuffer() noexcept { return m_null_write_buffer; }
+ 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+ 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
++	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(
++	    uint64_t vaddr, uint64_t size, const char* caller = nullptr, const ImageInfo* info = nullptr);
+ 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+ 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
+ 	                bool src_gds);
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index d4902f99..091d5da1 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -20,11 +20,14 @@
+ #include <array>
+ #include <bit>
+ #include <cinttypes>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <mutex>
++#include <set>
+ #include <span>
+ #include <tuple>
++#include <utility>
+ #include <vulkan/vulkan_format_traits.hpp>
+ 
+ namespace Libs::Graphics {
+@@ -1120,7 +1123,8 @@ void TextureCache::InitializeImage(ImageId id) {
+ 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+ 	if (upload) {
+ 		const auto [source, source_offset] =
+-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
++		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size,
++		                                        "TextureCache::InitializeImage", &image.info);
+ 		if (source == nullptr) {
+ 			EXIT("TextureCache: failed to obtain image upload source\n");
+ 		}
+@@ -1132,6 +1136,29 @@ void TextureCache::InitializeImage(ImageId id) {
+ 	}
+ }
+ 
++// V13: unreadable color-metadata backing skips fast-clear materialization (logged once per
++// address/size) unless KYTY_ZERO_UNMAPPED_IMAGE=0, which restores the old EXIT.
++static bool V13ZeroUnmappedMetadata(uint64_t address, uint64_t size, const char* what) {
++	static const bool enabled = [] {
++		const char* value = std::getenv("KYTY_ZERO_UNMAPPED_IMAGE");
++		return value == nullptr ||
++		       !(std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0 ||
++		         std::strcmp(value, "OFF") == 0 || std::strcmp(value, "false") == 0);
++	}();
++	if (!enabled) {
++		return false;
++	}
++	static std::mutex                               mutex;
++	static std::set<std::pair<uint64_t, uint64_t>> seen;
++	std::scoped_lock                                lock {mutex};
++	if (seen.size() < 256 && seen.emplace(address, size).second) {
++		LOGF("[V13] unreadable %s backing at 0x%016" PRIx64 " size=0x%" PRIx64
++		     " gpu_mapped=%d: fast-clear materialization skipped\n",
++		     what, address, size, LibKernel::Memory::IsGpuMapped(address, size) ? 1 : 0);
++	}
++	return true;
++}
++
+ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
+                                        uint32_t metadata_base_layer) {
+ 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
+@@ -1174,7 +1201,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
+ 		const auto address = range.address + slice_size * (first + slice);
+ 		uint8_t code = 0;
+ 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+-			EXIT("TextureCache: failed to read color metadata backing\n");
++			if (!V13ZeroUnmappedMetadata(address, slice_size, "color metadata code")) {
++				EXIT("TextureCache: failed to read color metadata backing\n");
++			}
++			continue; // V13: unreadable metadata -> no fast-clear materialization for this slice
+ 		}
+ 		vk::ClearValue clear {};
+ 		if (!DecodeColorClear(desc, code, clear.color)) {
+@@ -1182,7 +1212,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
+ 		}
+ 		std::vector<uint8_t> bytes(slice_size);
+ 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+-			EXIT("TextureCache: failed to read color metadata slice\n");
++			if (!V13ZeroUnmappedMetadata(address, slice_size, "color metadata slice")) {
++				EXIT("TextureCache: failed to read color metadata slice\n");
++			}
++			continue; // V13: unreadable metadata -> no fast-clear materialization for this slice
+ 		}
+ 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+ 			continue;
+diff --git a/src/kernel/memory.cpp b/src/kernel/memory.cpp
+index 888911f2..250dae54 100644
+--- a/src/kernel/memory.cpp
++++ b/src/kernel/memory.cpp
+@@ -966,7 +966,11 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
+ }
+ 
+ bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+-	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
++	return g_guest_address_space->CopySparseMemory<false>(vaddr, data, size);
++}
++
++bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
++	return g_guest_address_space->CopySparseMemory<true>(vaddr, data, size);
+ }
+ 
+ static bool SelfTestSub64SharedPlaceholderAlias() {
+diff --git a/src/kernel/memory.h b/src/kernel/memory.h
+index 1468c8fe..ac3d84cf 100644
+--- a/src/kernel/memory.h
++++ b/src/kernel/memory.h
+@@ -118,6 +118,7 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
+ // Whether the guest mapped [vaddr, vaddr + size) for GPU access.
+ [[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size) noexcept;
+ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
++bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+ [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+diff --git a/src/kernel/memoryAddressSpace.inc b/src/kernel/memoryAddressSpace.inc
+index 47e916f3..69bb6eb7 100644
+--- a/src/kernel/memoryAddressSpace.inc
++++ b/src/kernel/memoryAddressSpace.inc
+@@ -28,6 +28,35 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
+ }
+ #endif
+ 
++template <typename Regions, typename Source, typename Gap>
++static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, uint64_t size,
++                            Source&& source, Gap&& gap) {
++	const auto end     = vaddr + size;
++	auto       mapping = regions.lower_bound(vaddr);
++	if (mapping != regions.begin()) {
++		auto previous = std::prev(mapping);
++		if (previous->second.vaddr + previous->second.size > vaddr) {
++			mapping = previous;
++		}
++	}
++
++	auto* destination = static_cast<uint8_t*>(data);
++	auto  cursor      = vaddr;
++	for (; mapping != regions.end() && mapping->second.vaddr < end; ++mapping) {
++		const auto& entry = mapping->second;
++		const auto  start = std::max(vaddr, entry.vaddr);
++		const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
++		if (cursor < start) {
++			gap(cursor, destination + (cursor - vaddr), start - cursor);
++		}
++		std::memcpy(destination + (start - vaddr), source(entry, start), bytes);
++		cursor = start + bytes;
++	}
++	if (cursor < end) {
++		gap(cursor, destination + (cursor - vaddr), end - cursor);
++	}
++}
++
+ class GuestBackingStore {
+ public:
+ 	enum class FailureReason {
+@@ -247,7 +276,8 @@ public:
+ 		return true;
+ 	}
+ 
+-	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
++	template <typename Gap>
++	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
+ 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+ 			return false;
+ 		}
+@@ -258,31 +288,11 @@ public:
+ 			g_test_backing_read(vaddr, size);
+ 		}
+ #endif
+-		const auto end     = vaddr + size;
+-		auto       mapping = m_maps.lower_bound(vaddr);
+-		if (mapping != m_maps.begin()) {
+-			auto previous = std::prev(mapping);
+-			if (previous->second.vaddr + previous->second.size > vaddr) {
+-				mapping = previous;
+-			}
+-		}
+-
+-		auto* destination = static_cast<uint8_t*>(data);
+-		auto  cursor      = vaddr;
+-		for (; mapping != m_maps.end() && mapping->second.vaddr < end; ++mapping) {
+-			const auto& entry  = mapping->second;
+-			const auto  start  = std::max(vaddr, entry.vaddr);
+-			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
+-			const auto  offset = entry.backing_offset + start - entry.vaddr;
+-			if (cursor < start) {
+-				std::memset(destination + (cursor - vaddr), 0, start - cursor);
+-			}
+-			std::memcpy(destination + (start - vaddr), m_backing_base + offset, bytes);
+-			cursor = start + bytes;
+-		}
+-		if (cursor < end) {
+-			std::memset(destination + (cursor - vaddr), 0, end - cursor);
+-		}
++		CopySparseRange(m_maps, vaddr, data, size,
++		                [this](const auto& entry, uint64_t start) {
++			                return m_backing_base + (entry.backing_offset + start - entry.vaddr);
++		                },
++		                gap);
+ 		return true;
+ 	}
+ 
+@@ -773,22 +783,41 @@ public:
+ 		return m_backing->TryReadBacking(vaddr, data, size);
+ 	}
+ 
+-	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+-		if (!Owns(vaddr, size)) {
++	template <bool copy_private>
++	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
++		if (data == nullptr || !Owns(vaddr, size)) {
+ 			return false;
+ 		}
+ 		std::shared_lock lock(m_mutex);
+-		auto            mapping = m_mapped.upper_bound(vaddr);
+-		if (mapping != m_mapped.begin()) {
+-			--mapping;
+-		}
+-		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
+-			const auto& region = mapping->second;
+-			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+-				return false;
++		if constexpr (!copy_private) {
++			auto mapping = m_mapped.upper_bound(vaddr);
++			if (mapping != m_mapped.begin()) {
++				--mapping;
++			}
++			for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
++				const auto& region = mapping->second;
++				if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
++					return false;
++				}
+ 			}
+ 		}
+-		return m_backing->TryReadSparseBacking(vaddr, data, size);
++		return m_backing->TryReadSparseBacking(
++		    vaddr, data, size, [&](uint64_t start, uint8_t* destination, uint64_t bytes) {
++			    const auto zero = [](uint64_t, uint8_t* output, uint64_t length) {
++				    std::memset(output, 0, length);
++			    };
++			    if constexpr (copy_private) {
++				    // Backing gaps can contain private mappings or reservations only.
++				    CopySparseRange(m_mapped, start, destination, bytes,
++				                    [](const auto& region, uint64_t address) {
++					                    EXIT_IF(region.type != MappingType::Private);
++					                    return reinterpret_cast<const void*>(address);
++				                    },
++				                    zero);
++			    } else {
++				    zero(start, destination, bytes);
++			    }
++		    });
+ 	}
+ 
+ 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
