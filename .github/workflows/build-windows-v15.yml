@@ -1,0 +1,336 @@
+name: Build KytyPS5 descriptor fix V15 (V14 + split tracking toggles, compute hazard tracking, EOP label sync) for Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out the exact official revision
+        uses: actions/checkout@v4
+        with:
+          repository: KytyPS5/KytyPS5
+          ref: 7b9997baea0d385e9e8fc2bd3abeb02110bc4148
+          path: source
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check out the V15 kit (this branch) for the patches
+        uses: actions/checkout@v4
+        with:
+          path: kit
+          persist-credentials: false
+
+      - name: Verify and apply the V5 cumulative patch + upstream PR 1194 + V7 + V8 + V9 + V10 + V11 + V12 + V13 + V14 + V15
+        shell: python
+        run: |
+          import hashlib, pathlib, subprocess
+          # 1) Cumulative V5 patch vs 7b9997b: V4 Layer A + V4B Layer B + V5-B. Pinned by SHA256 (unchanged from V5).
+          v5_expected = "6212fc121db62685ca327d14503ef6297de8b949315c89339062cccf3757f00b"
+          v5_dir = pathlib.Path("kit/descriptor-fix-v5")
+          parts = [v5_dir / f"descriptor-v5.patch.part{i:02d}" for i in range(3)]
+          missing = [str(p) for p in parts if not p.is_file()]
+          assert not missing, f"Missing patch parts: {missing}"
+          # Windows runners may check text out with CRLF (core.autocrlf); the pinned patches are LF-only.
+          v5 = b"".join(p.read_bytes() for p in parts).replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v5).hexdigest() == v5_expected, "V5 patch checksum mismatch"
+          # 2) Upstream KytyPS5 PR #1194 "graphics: read unmapped shader resource memory as zero" (as-is).
+          pr_expected = "777acbc6a80da0f39526d645b96114cfb71cdfbdabfe59a599044f7ae55a37a5"
+          pr = pathlib.Path("kit/descriptor-fix-v6/upstream-pr1194-srt-ordinary-reader.diff").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(pr).hexdigest() == pr_expected, "PR 1194 patch checksum mismatch"
+          # 3) V7 on top of V6: #780 device-fault reporter + dispatch ring, NeySlim #1294 zeroed BDA
+          #    page table + fault-buffer clear, KYTY_GLC_ATOMIC_LOAD knob (default off).
+          v7_expected = "e822e3ffd1a9f4a73ddfab45e535be5ae2f0e87b7d1b5d78a7c3b5e856ec02d8"
+          v7 = pathlib.Path("kit/descriptor-fix-v7/v7-on-v6.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v7).hexdigest() == v7_expected, "V7 patch checksum mismatch"
+          # 4) V8 on top of V7: AgcQueueEndOfPipeActionPatchAddress on an all-zero packet header is a
+          #    logged no-op (once per cmd address, max 64 sites) instead of EXIT (agc.cpp:3960).
+          v8_expected = "0d61586e5f72155e2780efa9aefdef7726984e4d7e9d29e6eaebe16eede92205"
+          v8 = pathlib.Path("kit/descriptor-fix-v8/v8-on-v7.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v8).hexdigest() == v8_expected, "V8 patch checksum mismatch"
+          # 5) V9 on top of V8: VOP2 V_MIN_I32 (0x11) SDWA + V_MAX_I32/V_MAX_U32 partial SDWA destination.
+          v9_expected = "56848a7e58a04e35ac4a2087a1c89abff2772d1a552d0e92299c0728c2b3cea2"
+          v9 = pathlib.Path("kit/descriptor-fix-v9/v9-on-v8.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v9).hexdigest() == v9_expected, "V9 patch checksum mismatch"
+          # 6) V10 on top of V9: host-side null-write guard (KYTY_NULL_WRITE_GUARD, default on).
+          v10_expected = "52ce50272cbebc9bbddb41b072fd8280a60dd6f415b6c493d62d61e3d8626f22"
+          v10 = pathlib.Path("kit/descriptor-fix-v10/v10-on-v9.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v10).hexdigest() == v10_expected, "V10 patch checksum mismatch"
+          # 7) V11 on top of V10: VOPC SDWA for all 16/32-bit compares (Ace Combat 8 pc 0x2400 v_cmpx_nge_f16)
+          #    + remaining RDNA2 F16/CMPX compare opcodes.
+          v11_expected = "8e10f255674a3318f861d5a8498da4e3bb5441a045711f036bb4c66518fe630c"
+          v11 = pathlib.Path("kit/descriptor-fix-v11/v11-on-v10.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v11).hexdigest() == v11_expected, "V11 patch checksum mismatch"
+          # 8) V12 on top of V11: ACQUIRE_MEM -> global barrier (default on, KYTY_ACQUIRE_MEM_BARRIER=0 off)
+          #    + debug sync switches KYTY_SYNC_COMPUTE=1/2 and KYTY_SYNC_SUBMIT=1 (default off).
+          v12_expected = "e0d1f34901eef03bb3d77f543d7adb40996dbd94d3b682fa5ea55ebb36d5cbfa"
+          v12 = pathlib.Path("kit/descriptor-fix-v12/v12-on-v11.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v12).hexdigest() == v12_expected, "V12 patch checksum mismatch"
+          # 9) V13 on top of V12: upstream 9bcf80bf + 40692dfb (oversized image staging, sparse copies
+          #    through resident private mappings) + unreadable guest image/buffer backing read page by
+          #    page with zero fill and [V13] logs instead of EXIT (KYTY_ZERO_UNMAPPED_IMAGE=0 restores EXIT).
+          v13_expected = "a582b6b4cbd452b131b29d9771ef5789a3183055bb69299ddefd846e8f4eafd3"
+          v13 = pathlib.Path("kit/descriptor-fix-v13/v13-on-v12.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v13).hexdigest() == v13_expected, "V13 patch checksum mismatch"
+          # 10) V14 on top of V13: hazard-tracked barriers (KYTY_SYNC_COMPUTE=3 default; 0/1/2/4 kept),
+          #     CPU readback of indirect args waits for GPU producers, pipeline cache keyed by the
+          #     cumulative patch SHA256 for dirty builds + periodic save, NV checkpoints/diagnostics
+          #     and [watch-0x1640] logs off by default.
+          v14_expected = "0c8c631d1b65a9fb7c00ed426f1fca9856fd76bd6726d44a78949b7c09489a2e"
+          v14 = pathlib.Path("kit/descriptor-fix-v14/v14-on-v13.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v14).hexdigest() == v14_expected, "V14 patch checksum mismatch"
+          # 11) V15 on top of V14: split V7 tracking toggles (KYTY_NV_CHECKPOINTS, KYTY_NV_DIAG_CONFIG,
+          #     KYTY_WATCH_1640, KYTY_DISPATCH_LOG_FLUSH), compute hazard tracking with real ranges,
+          #     KYTY_EOP_LABEL_SYNC, dispatch-ring order fix.
+          v15_expected = "ef849d138e6962aba0f34184695298e8fca441a31d77ad0e90be63a9a062e33f"
+          v15 = pathlib.Path("kit/descriptor-fix-v15/v15-on-v14.patch").read_bytes().replace(b"\r\n", b"\n")
+          assert hashlib.sha256(v15).hexdigest() == v15_expected, "V15 patch checksum mismatch"
+          for name, data in (("descriptor-v5.patch", v5), ("upstream-pr1194-srt-ordinary-reader.diff", pr), ("v7-on-v6.patch", v7), ("v8-on-v7.patch", v8), ("v9-on-v8.patch", v9), ("v10-on-v9.patch", v10), ("v11-on-v10.patch", v11), ("v12-on-v11.patch", v12), ("v13-on-v12.patch", v13), ("v14-on-v13.patch", v14), ("v15-on-v14.patch", v15)):
+              path = pathlib.Path(name).resolve()
+              path.write_bytes(data)
+              subprocess.run(["git", "-C", "source", "apply", "--check", str(path)], check=True)
+              subprocess.run(["git", "-C", "source", "apply", str(path)], check=True)
+          subprocess.run(["git", "-C", "source", "diff", "--check"], check=True)
+          # Cumulative V15 patch (V5 + PR 1194 + V7..V15) vs 7b9997b for provenance; its SHA256 keys the
+          # Vulkan pipeline cache of this (dirty) build through -DKYTY_PATCH_ID.
+          subprocess.run(["git", "-C", "source", "add", "-A"], check=True)
+          v7c = subprocess.check_output(["git", "-C", "source", "diff", "--cached"])
+          pathlib.Path("descriptor-v15-cumulative.patch").write_bytes(v7c)
+          import os
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"KYTY_PATCH_ID={hashlib.sha256(v7c).hexdigest()}\n")
+          shas = {
+              "descriptor-v5.patch (parts 00..02 joined)": hashlib.sha256(v5).hexdigest(),
+              "upstream-pr1194-srt-ordinary-reader.diff": hashlib.sha256(pr).hexdigest(),
+              "v7-on-v6.patch": hashlib.sha256(v7).hexdigest(),
+              "v8-on-v7.patch": hashlib.sha256(v8).hexdigest(),
+              "v9-on-v8.patch": hashlib.sha256(v9).hexdigest(),
+              "v10-on-v9.patch": hashlib.sha256(v10).hexdigest(),
+              "v11-on-v10.patch": hashlib.sha256(v11).hexdigest(),
+              "v12-on-v11.patch": hashlib.sha256(v12).hexdigest(),
+              "v13-on-v12.patch": hashlib.sha256(v13).hexdigest(),
+              "v14-on-v13.patch": hashlib.sha256(v14).hexdigest(),
+              "v15-on-v14.patch": hashlib.sha256(v15).hexdigest(),
+              "descriptor-v15-cumulative.patch (generated)": hashlib.sha256(v7c).hexdigest(),
+          }
+          pathlib.Path("patch-shas.txt").write_text("".join(f"{v}  {k}\n" for k, v in shas.items()), encoding="utf-8")
+          print(pathlib.Path("patch-shas.txt").read_text())
+          subprocess.run(["git", "-C", "source", "reset", "-q"], check=True)
+
+      - name: Set up Visual Studio x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vcpkgRoot = Split-Path (Get-Command vcpkg -ErrorAction Stop).Source
+          & vcpkg install 'glslang[tools,opt]:x64-windows'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure the patched source
+        shell: cmd
+        run: >-
+          cmake -S source -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          -DKYTY_BUILD_ORIGIN=Source
+          -DKYTY_PATCH_ID=%KYTY_PATCH_ID%
+
+      - name: Compile the launcher, emulator, and regression tests
+        shell: cmd
+        run: cmake --build build --target launcher kyty_emulator resource_tracking_tests --parallel 4
+
+      - name: Run resource-tracking regression tests
+        shell: cmd
+        run: ctest --test-dir build -R "^resource_tracking$" --output-on-failure
+
+      - name: Stage a runnable Windows installation
+        shell: cmd
+        run: cmake --install build --prefix install
+
+      - name: Verify executables and attach provenance
+        shell: python
+        run: |
+          import pathlib, shutil, subprocess, zipfile
+          install = pathlib.Path("install")
+          for filename in ("launcher.exe", "kyty_emulator.exe"):
+              assert (install / filename).is_file(), f"Missing {filename}"
+          shutil.copy2("descriptor-v5.patch", install / "descriptor-v5.patch")
+          shutil.copy2("upstream-pr1194-srt-ordinary-reader.diff", install / "upstream-pr1194-srt-ordinary-reader.diff")
+          shutil.copy2("v7-on-v6.patch", install / "v7-on-v6.patch")
+          shutil.copy2("v8-on-v7.patch", install / "v8-on-v7.patch")
+          shutil.copy2("v9-on-v8.patch", install / "v9-on-v8.patch")
+          shutil.copy2("v10-on-v9.patch", install / "v10-on-v9.patch")
+          shutil.copy2("v11-on-v10.patch", install / "v11-on-v10.patch")
+          shutil.copy2("v12-on-v11.patch", install / "v12-on-v11.patch")
+          shutil.copy2("v13-on-v12.patch", install / "v13-on-v12.patch")
+          shutil.copy2("v14-on-v13.patch", install / "v14-on-v13.patch")
+          shutil.copy2("v15-on-v14.patch", install / "v15-on-v14.patch")
+          shutil.copy2("descriptor-v15-cumulative.patch", install / "descriptor-v15-cumulative.patch")
+          shutil.copy2("kit/descriptor-fix-v7/README-V7.txt", install / "README-V7.txt")
+          shutil.copy2("kit/descriptor-fix-v8/README-V8.txt", install / "README-V8.txt")
+          shutil.copy2("kit/descriptor-fix-v9/README-V9.txt", install / "README-V9.txt")
+          shutil.copy2("kit/descriptor-fix-v10/README-V10.txt", install / "README-V10.txt")
+          shutil.copy2("kit/descriptor-fix-v11/README-V11.txt", install / "README-V11.txt")
+          shutil.copy2("kit/descriptor-fix-v12/README-V12.txt", install / "README-V12.txt")
+          shutil.copy2("kit/descriptor-fix-v13/README-V13.txt", install / "README-V13.txt")
+          shutil.copy2("kit/descriptor-fix-v14/README-V14.txt", install / "README-V14.txt")
+          shutil.copy2("kit/descriptor-fix-v15/README-V15.txt", install / "README-V15.txt")
+          import os
+          commit = os.environ.get("GITHUB_SHA", "unknown")
+          ref = os.environ.get("GITHUB_REF_NAME", "unknown")
+          run = os.environ.get("GITHUB_RUN_ID", "unknown")
+          shutil.copy2("source/LICENSE", install / "LICENSE")
+          shutil.copytree("source/LICENSES", install / "LICENSES", dirs_exist_ok=True)
+          (install / "BUILD-INFO.txt").write_text(
+              "KytyPS5 descriptor fix V15 - EXPERIMENTAL DIAGNOSTIC BUILD.\n"
+              f"Kit branch: {ref}  kit commit: {commit}  Actions run: {run}\n"
+              "Base: 7b9997baea0d385e9e8fc2bd3abeb02110bc4148 (no upstream-main rebase)\n"
+              "Contents: V6 (= V4 Layer A + V4B Layer B + V5-B + upstream PR #1194 SRT ordinary reader)\n"
+              " + V7.1 Kyty #780 device-fault reporter (itsmemac 1919d512): VK_EXT_device_fault (queried\n"
+              "   counts-then-details only after DeviceLost), NV diagnostic checkpoints on every compute\n"
+              "   dispatch (with shader hash), NV diagnostics config, VK_EXT_device_address_binding_report\n"
+              "   (bind/unbind ranges matched against the fault VA), last-256 dispatch ring on DeviceLost,\n"
+              "   and every dispatch with shader address 0x1640xxxxxx logged as [watch-0x1640]. All optional.\n"
+              " + V7.2 NeySlim ccfcb32a/#1294 BDA page table zeroed at creation (always on) +\n"
+              "   de6966b1 fault-buffer clear at creation (always on).\n"
+              " + V7.3 AnyPS5 #2259 port: KYTY_GLC_ATOMIC_LOAD=1 (default OFF) makes coherent BDA dword\n"
+              "   loads Device-scope atomic loads. #919 dwordx2 and bound-buffer coherent path DEFERRED.\n"
+              " + V8 AgcQueueEndOfPipeActionPatchAddress: zero packet header -> logged no-op ([V8] log line).\n"
+              " + V9 shader decoder: VOP2 V_MIN_I32 (0x11) accepts SDWA byte/word source selects\n"
+              "   (sext honoured by the shared SDWA source reader); V_MAX_I32/V_MAX_U32 also allow\n"
+              "   partial (byte/word) SDWA destinations like V_MIN_U32.\n"
+              " + V10 host-side null-write guard (KYTY_NULL_WRITE_GUARD, default ON, =0 disables):\n"
+              "   written buffer V#s with base 0 bind a 16 MiB device-local sink (not the 16-byte null\n"
+              "   buffer); written storage T#s with base 0 bind the 1x1 null storage image; cache buffers\n"
+              "   with device address 0 never publish BDA page-table entries. [V10] log once per\n"
+              "   (shader hash, slot).\n"
+              " + V11 shader decoder: VOPC SDWA accepted for every 16/32-bit compare/class opcode\n"
+              "   (src0/src1 byte/word sel + sext, scalar sources via S0/S1, SD=0 -> VCC, SD=1 -> SGPR pair,\n"
+              "   CMPX -> EXEC); adds missing RDNA2 VOPC opcodes incl. 0xf9 V_CMPX_NGE_F16 (AC8 pc 0x2400).\n"
+              " + V12 sync: guest ACQUIRE_MEM (was a no-op) now emits a global memory barrier (default ON,\n"
+              "   KYTY_ACQUIRE_MEM_BARRIER=0 restores the no-op). Debug switches (default OFF, logged at\n"
+              "   startup as 'GPU: V12 sync debug'): KYTY_SYNC_COMPUTE=1 barrier after every dispatch and\n"
+              "   before every draw; KYTY_SYNC_COMPUTE=2 barrier only after a dispatch followed by a\n"
+              "   dispatch/draw; KYTY_SYNC_SUBMIT=1 waits for every queue submit (queue waitIdle).\n"
+              "   Run scripts: R3 = KYTY_SYNC_COMPUTE=1, R4 = KYTY_SYNC_COMPUTE=1 + KYTY_SYNC_SUBMIT=1.\n"
+              " + V13 guest-read tolerance: ports upstream 9bcf80bf (oversized image uploads use a temporary\n"
+              "   staging buffer) + 40692dfb (sparse buffer uploads copy through resident private mappings).\n"
+              "   ObtainBufferForImage (bufferCache.cpp:545 'failed to read mapped guest image backing'),\n"
+              "   stream/UploadCopies buffer reads and color-metadata reads no longer EXIT: readable pages\n"
+              "   (16 KiB) keep their bytes, unreadable pages are zero-filled ([V13] log once per addr/size\n"
+              "   with format/extent/tiling/caller/bad subranges). KYTY_ZERO_UNMAPPED_IMAGE=0 restores EXIT.\n"
+              " + V14 sync/perf: KYTY_SYNC_COMPUTE default is now 3 = hazard-tracked global barrier before a\n"
+              "   dispatch/draw that reads memory written by a graphics stage outside the per-dispatch\n"
+              "   compute barrier (storage images, BDA, indirect args); [V14] hazard lines name the\n"
+              "   producer/consumer shader pair. 0 = V13, 1/2 unchanged, 4 = 3 + 2. Graphics buffer-write\n"
+              "   barrier now also covers DRAW_INDIRECT. DrawIndirect(Multi)/count and DispatchIndirect with\n"
+              "   thread dimensions read their args through the buffer cache (GPU-dirty bytes downloaded,\n"
+              "   waiting for the producer) instead of raw guest memory.\n"
+              " + V14 pipeline cache: dirty builds keep the Vulkan pipeline cache, keyed by -DKYTY_PATCH_ID\n"
+              "   (= SHA256 of descriptor-v15-cumulative.patch) in file name and signature;\n"
+              "   _PipelineCache/<TITLE>-<id16>.bin is also saved every 32 new pipelines (>=20 s apart).\n"
+              " + V14 defaults: NV checkpoints + NV diagnostics config OFF (KYTY_NV_DIAGNOSTICS=1 enables),\n"
+              "   [watch-0x1640] per-dispatch lines OFF (KYTY_WATCH_1640=1 enables). Device-fault report,\n"
+              "   address-binding report and the 256-dispatch ring stay on.\n"
+              " + V15 tracking split (all default OFF): KYTY_NV_CHECKPOINTS=1 (vkCmdSetCheckpointNV per\n"
+              "   dispatch), KYTY_NV_DIAG_CONFIG=1 (VK_NV_device_diagnostics_config), KYTY_WATCH_1640=1\n"
+              "   ([watch-0x1640] lines), KYTY_DISPATCH_LOG_FLUSH=1 (per-dispatch line + fflush: logging\n"
+              "   cost emulation); KYTY_NV_DIAGNOSTICS=1 = both NV parts as in V14.\n"
+              " + V15 compute hazard tracking (KYTY_SYNC_COMPUTE=3/4): [V15] compute hazard lines with\n"
+              "   read/write ranges for compute->dispatch/indirect/draw RAW; KYTY_HAZARD_COMPUTE_BARRIER=1\n"
+              "   adds an explicit barrier. V14 hazard lines now print producer ranges (no more addr=0).\n"
+              " + V15 KYTY_EOP_LABEL_SYNC: 1 = GPU finished before a parse-time EOP label write becomes\n"
+              "   guest-visible, 2 = log only, 0 = V14 (default). Dispatch ring printed oldest->newest.\n"
+              "NOT included: #1403, #986, #1138, #4279. Never set KYTY_BDA_WRITES=0.\n"
+              "Ace Combat 8 (PPSA24913) patch version: REPORT 01.000.000 / 01.001.000 / 01.001.001.\n"
+              "Patch SHA256s:\n" + pathlib.Path("patch-shas.txt").read_text(encoding="utf-8") +
+              "Resource-tracking tests passed in this build.\n"
+              "Upstream: https://github.com/KytyPS5/KytyPS5\n", encoding="utf-8")
+          (install / "Run-PPSA24913-Diagnostic-V15-R1.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" --graphics-debug-dump true --shader-log-direction File --shader-log-folder "_Shaders-V15-R1" --printf-direction File --printf-output-file "ace-combat-detail-v15-R1.txt" > "ace-combat-log-v15-R1.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-V15-R5-FAST.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" > "ace-combat-log-v15-R5-FAST.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-V15-R7-FAST-NV-CHECKPOINTS.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_NV_CHECKPOINTS=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" > "ace-combat-log-v15-R7.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-V15-R8-FAST-NV-DIAG-CONFIG.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_NV_DIAG_CONFIG=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" > "ace-combat-log-v15-R8.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-V15-R9-FAST-WATCH-1640.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_WATCH_1640=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" > "ace-combat-log-v15-R9.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-V15-R10-FAST-SYNC-COMPUTE-SUBMIT.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_SYNC_COMPUTE=1"\r\nset "KYTY_SYNC_SUBMIT=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" > "ace-combat-log-v15-R10.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-V15-R11-FAST-EOP-LABEL-SYNC.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_EOP_LABEL_SYNC=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" > "ace-combat-log-v15-R11.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          (install / "Run-PPSA24913-V15-R12-FAST-DISPATCH-LOG-FLUSH.cmd").write_bytes(b'@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "KYTY_DISPATCH_LOG_FLUSH=1"\r\nset "GAME=F:\\Games\\PS5 Emulator and Games\\PPSA24913-app0"\r\nif not exist "kyty_emulator.exe" (\r\n  echo Copy this file next to kyty_emulator.exe first.\r\n  pause\r\n  exit /b 1\r\n)\r\nif not exist "%GAME%\\eboot.bin" (\r\n  echo Game not found at "%GAME%". Edit the GAME line in this file.\r\n  pause\r\n  exit /b 1\r\n)\r\nkyty_emulator.exe --game "%GAME%" > "ace-combat-log-v15-R12.txt" 2>&1\r\necho Emulator exited. Logs are saved beside this script.\r\npause\r\n')
+          # Include the modified tracked source and the pinned submodule list for review.
+          entries = subprocess.check_output(["git", "-C", "source", "ls-files", "--stage", "-z"]).decode().split("\0")
+          with zipfile.ZipFile("patched-source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+              for entry in entries:
+                  if not entry:
+                      continue
+                  meta, name = entry.split("\t", 1)
+                  if meta.startswith("160000 "):
+                      continue
+                  archive.write(pathlib.Path("source") / name, name)
+              refs = subprocess.check_output(["git", "-C", "source", "submodule", "status", "--recursive"])
+              archive.writestr("PINNED-SUBMODULES.txt", refs)
+              archive.write("descriptor-v5.patch", "descriptor-v5.patch")
+              archive.write("upstream-pr1194-srt-ordinary-reader.diff", "upstream-pr1194-srt-ordinary-reader.diff")
+              archive.write("v7-on-v6.patch", "v7-on-v6.patch")
+              archive.write("v8-on-v7.patch", "v8-on-v7.patch")
+              archive.write("v9-on-v8.patch", "v9-on-v8.patch")
+              archive.write("v10-on-v9.patch", "v10-on-v9.patch")
+              archive.write("v11-on-v10.patch", "v11-on-v10.patch")
+              archive.write("v12-on-v11.patch", "v12-on-v11.patch")
+              archive.write("v13-on-v12.patch", "v13-on-v12.patch")
+              archive.write("v14-on-v13.patch", "v14-on-v13.patch")
+              archive.write("v15-on-v14.patch", "v15-on-v14.patch")
+              archive.write("descriptor-v15-cumulative.patch", "descriptor-v15-cumulative.patch")
+              archive.write("patch-shas.txt", "patch-shas.txt")
+
+      - name: Downloadable Windows executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Descriptor-Fix-V15-Windows-x64
+          path: install/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Downloadable modified source
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Descriptor-Fix-V15-Source
+          path: patched-source.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Test diagnostics if the build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Descriptor-Fix-V15-Diagnostics
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Optional shader CFG regression tests (non-blocking)
+        if: success()
+        continue-on-error: true
+        shell: cmd
+        run: cmake --build build --target shader_cfg_tests --parallel 4 && ctest --test-dir build -R "^shader_cfg$" --output-on-failure
