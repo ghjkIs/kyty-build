@@ -1,0 +1,752 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e257040a..8f1cbf93 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -58,6 +58,10 @@ if(NOT KYTY_BUILD_ORIGIN STREQUAL "Source" AND NOT KYTY_BUILD_ORIGIN STREQUAL "O
+ endif()
+ 
+ set(KYTY_RELEASE_TAG "" CACHE STRING "Release tag embedded in official builds")
++# V14: identity of the applied patch stack (e.g. SHA256 of the cumulative patch). A non-empty
++# value lets dirty (patched) source builds keep the persistent Vulkan pipeline cache, keyed by it.
++set(KYTY_PATCH_ID "" CACHE STRING "Patch-stack identity used to key the pipeline cache of dirty builds")
++string(REGEX REPLACE "[^0-9A-Za-z._-]" "" KYTY_PATCH_ID_SANITIZED "${KYTY_PATCH_ID}")
+ set(KYTY_BUILD_REPOSITORY "" CACHE STRING "GitHub repository embedded in fork builds")
+ set(KYTY_OFFICIAL_BUILD OFF)
+ set(KYTY_FORK_BUILD OFF)
+diff --git a/src/cmake_config.h.in b/src/cmake_config.h.in
+index 5507814c..6e846ca9 100644
+--- a/src/cmake_config.h.in
++++ b/src/cmake_config.h.in
+@@ -1,6 +1,7 @@
+ #define KYTY_VERSION "@KYTY_VERSION@"
+ #define KYTY_BUILD_REPOSITORY "@KYTY_BUILD_REPOSITORY@"
+ #define KYTY_RELEASE_TAG "@KYTY_RELEASE_TAG@"
++#define KYTY_PATCH_ID "@KYTY_PATCH_ID_SANITIZED@"
+ #cmakedefine KYTY_OFFICIAL_BUILD
+ #cmakedefine KYTY_FORK_BUILD
+ #define KYTY_ENDIAN @KYTY_ENDIAN@
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 66bc73b5..9bdbf457 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -14,6 +14,7 @@
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/renderer/sync.h"
+ #include "graphics/host_gpu/renderer/debugSync.h"
++#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+ #include "graphics/presentation/videoOut.h"
+ #include "graphics/presentation/window.h"
+ #include "graphics/shader/shader.h"
+@@ -25,6 +26,7 @@
+ #include <array>
+ #include <atomic>
+ #include <cstdio>
++#include <cstring>
+ #include <deque>
+ #include <memory>
+ #include <mutex>
+@@ -851,7 +853,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t
+ 
+ void CommandProcessor::DebugSyncBeforeDispatch() {
+ 	// V12 KYTY_SYNC_COMPUTE=2: order back-to-back dispatches.
+-	if (DebugSyncComputeMode() == 2 && m_debug_sync_after_dispatch) {
++	const int mode = DebugSyncComputeMode();
++	if ((mode == 2 || mode == 4) && m_debug_sync_after_dispatch) {
+ 		EmitGlobalBarrier();
+ 	}
+ 	m_debug_sync_after_dispatch = false;
+@@ -861,14 +864,14 @@ void CommandProcessor::DebugSyncAfterDispatch() {
+ 	const int mode = DebugSyncComputeMode();
+ 	if (mode == 1) {
+ 		EmitGlobalBarrier();
+-	} else if (mode == 2) {
++	} else if (mode == 2 || mode == 4) {
+ 		m_debug_sync_after_dispatch = true;
+ 	}
+ }
+ 
+ void CommandProcessor::DebugSyncBeforeDraw() {
+ 	const int mode = DebugSyncComputeMode();
+-	if (mode == 1 || (mode == 2 && m_debug_sync_after_dispatch)) {
++	if (mode == 1 || ((mode == 2 || mode == 4) && m_debug_sync_after_dispatch)) {
+ 		EmitGlobalBarrier();
+ 	}
+ 	m_debug_sync_after_dispatch = false;
+@@ -902,6 +905,18 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
+ 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
+ }
+ 
++// V14: CPU readback of GPU-produced indirect arguments / counts. Bytes written by earlier GPU
++// work (tracked as GPU-dirty in the buffer cache) are downloaded first, which submits and waits
++// for the producing work; untracked memory falls back to the direct guest read.
++template <typename T>
++static T ReadIndirectArgs(uint64_t address) {
++	T value {};
++	if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, &value, sizeof(T))) {
++		std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(T));
++	}
++	return value;
++}
++
+ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters registers,
+                                      uint32_t vertex_offset, uint32_t instance_offset,
+                                      uint32_t first_index) {
+@@ -933,7 +948,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
+ 
+ 	uint32_t draw_count = max_count_or_count;
+ 	if (count_addr != nullptr) {
+-		draw_count = *count_addr;
++		draw_count = ReadIndirectArgs<uint32_t>(reinterpret_cast<uint64_t>(count_addr));
+ 		if (draw_count > max_count_or_count) {
+ 			draw_count = max_count_or_count;
+ 		}
+@@ -961,7 +976,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
+ 		                       static_cast<uint64_t>(i) * stride_in_bytes;
+ 
+ 		if (!indexed) {
+-			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
++			const auto args_copy = ReadIndirectArgs<DrawIndirectArgs>(args_addr);
++			const auto* args     = &args_copy;
+ 			PatchIndirectDrawOffsets(*this, registers, args->start_vertex_location,
+ 			                         args->start_instance_location, 0);
+ 			m_num_instances = args->instance_count;
+@@ -973,7 +989,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
+ 			continue;
+ 		}
+ 
+-		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
++		const auto args_copy = ReadIndirectArgs<DrawIndexedIndirectArgs>(args_addr);
++		const auto* args     = &args_copy;
+ 		PatchIndirectDrawOffsets(*this, registers, args->base_vertex_location,
+ 		                         args->start_instance_location, args->start_index_location);
+ 
+@@ -1039,8 +1056,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
+ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+ 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
+ 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
+-		DispatchDirect(args->x, args->y, args->z, mode);
++		const auto args = ReadIndirectArgs<vk::DispatchIndirectCommand>(args_addr);
++		DispatchDirect(args.x, args.y, args.z, mode);
+ 		return;
+ 	}
+ 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+@@ -1298,6 +1315,8 @@ void CommandProcessor::EmitGlobalBarrier() {
+ 	dependency.pMemoryBarriers    = &barrier;
+ 	GetScheduler().EndRendering();
+ 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
++	// V14: a global barrier orders every pending write.
++	HazardReset();
+ }
+ 
+ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
+diff --git a/src/graphics/host_gpu/diagnosticCheckpoints.cpp b/src/graphics/host_gpu/diagnosticCheckpoints.cpp
+index a0fe2c52..4e6261b3 100644
+--- a/src/graphics/host_gpu/diagnosticCheckpoints.cpp
++++ b/src/graphics/host_gpu/diagnosticCheckpoints.cpp
+@@ -1,3 +1,4 @@
++#include "graphics/host_gpu/renderer/debugSync.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+ 
+ #include "common/logging/log.h"
+@@ -136,7 +137,9 @@ void RecordDispatch(const DispatchRecord& record) {
+ 		copy.sequence = ++g_dispatch_sequence;
+ 		g_dispatches[copy.sequence % DISPATCH_RING_SIZE] = copy;
+ 	}
+-	if (IsWatchedShader(copy.shader_addr)) {
++	// V14: per-dispatch [watch-0x1640] console lines are opt-in (KYTY_WATCH_1640=1).
++	static const bool watch = DebugSyncEnvInt("KYTY_WATCH_1640", 0) != 0;
++	if (watch && IsWatchedShader(copy.shader_addr)) {
+ 		PrintDispatch("watch-0x1640", copy);
+ 	}
+ }
+diff --git a/src/graphics/host_gpu/renderer/cache/faultManager.cpp b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+index 5ada20e5..2d2ef6a1 100644
+--- a/src/graphics/host_gpu/renderer/cache/faultManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+@@ -94,11 +94,13 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
+ 	m_scheduler.Submit();
+ 
+ 	Log::WriteToConsoleAndLog(
+-	    fmt::format("GPU: V12 sync debug: KYTY_SYNC_COMPUTE={} ({}), KYTY_SYNC_SUBMIT={}, "
++	    fmt::format("GPU: V14 sync: KYTY_SYNC_COMPUTE={} ({}), KYTY_SYNC_SUBMIT={}, "
+ 	                "ACQUIRE_MEM barrier={} (KYTY_ACQUIRE_MEM_BARRIER)\n",
+ 	                DebugSyncComputeMode(),
+ 	                DebugSyncComputeMode() == 1   ? "barrier after every dispatch and before every draw"
+ 	                : DebugSyncComputeMode() == 2 ? "barrier after dispatch when followed by dispatch/draw"
++	                : DebugSyncComputeMode() == 3 ? "V14 hazard-tracked barriers (default)"
++	                : DebugSyncComputeMode() == 4 ? "V14 hazard-tracked + mode 2"
+ 	                                              : "off",
+ 	                DebugSyncSubmit() ? 1 : 0, AcquireMemBarrierEnabled() ? "on" : "off")
+ 	        .c_str());
+diff --git a/src/graphics/host_gpu/renderer/debugSync.h b/src/graphics/host_gpu/renderer/debugSync.h
+index 148d9d39..a825a555 100644
+--- a/src/graphics/host_gpu/renderer/debugSync.h
++++ b/src/graphics/host_gpu/renderer/debugSync.h
+@@ -10,6 +10,17 @@
+ //                 draw
+ //   "2"         - lighter: barrier only after a dispatch that is followed by another dispatch
+ //                 or a draw (no draw->draw barriers)
++//   "3"         - V14 DEFAULT: hazard-tracked barrier. Every compute dispatch already ends with
++//                 a COMPUTE_SHADER -> ALL_COMMANDS memory barrier (upstream ShaderAccessBarrier),
++//                 so compute->compute/draw RAW through bound buffers is ordered. What is NOT
++//                 ordered are writes made outside the compute stage: graphics-stage storage
++//                 buffer/image writes and graphics BDA writes. Mode 3 records those (guest
++//                 ranges for buffers, a flag for images/BDA) and emits one global barrier before
++//                 the first later dispatch/draw that reads an overlapping range, an image, BDA
++//                 memory, or indirect arguments in a pending range. Barrier sites are logged as
++//                 [V14] hazard lines (first 64, then every 4096th).
++//   "4"         - mode 3 + mode 2 (safer fallback).
++//   "0"         - V13 behaviour (no extra barriers).
+ // KYTY_SYNC_SUBMIT=1: wait for every queue submit to complete (queue waitIdle) before continuing.
+ // KYTY_ACQUIRE_MEM_BARRIER (default on): V12 maps guest ACQUIRE_MEM to a global barrier;
+ //   "0" restores the pre-V12 no-op.
+@@ -28,10 +39,16 @@ inline int DebugSyncEnvInt(const char* name, int def) {
+ }
+ 
+ inline int DebugSyncComputeMode() {
+-	static const int mode = DebugSyncEnvInt("KYTY_SYNC_COMPUTE", 0);
++	static const int mode = DebugSyncEnvInt("KYTY_SYNC_COMPUTE", 3);
+ 	return mode;
+ }
+ 
++// V14: hazard tracking is active in modes 3 and 4.
++inline bool DebugSyncHazardTracking() {
++	const int mode = DebugSyncComputeMode();
++	return mode == 3 || mode == 4;
++}
++
+ inline bool DebugSyncSubmit() {
+ 	static const bool on = DebugSyncEnvInt("KYTY_SYNC_SUBMIT", 0) != 0;
+ 	return on;
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index bc222f79..93533c07 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -1,5 +1,7 @@
+ #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+ 
++#include <chrono>
++
+ #include "common/assert.h"
+ #include "common/emulatorConfig.h"
+ #include "common/file.h"
+@@ -71,6 +73,14 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
+ 	}
+ }
+ 
++#ifndef KYTY_PATCH_ID
++#define KYTY_PATCH_ID ""
++#endif
++// V14: the patch-stack identity (cumulative patch SHA256) baked in by the kit build.
++std::string_view PipelineCachePatchId() {
++	return KYTY_PATCH_ID;
++}
++
+ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+ 	constexpr char hex[] = "0123456789abcdef";
+ 	std::string    uuid(VK_UUID_SIZE * 2, '0');
+@@ -78,8 +88,8 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
+ 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
+ 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
+ 	}
+-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
++	return fmt::format("KytyPC1:{}:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
++	                   PipelineCachePatchId(), properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+ }
+ 
+ std::string PipelineCacheTitleId() {
+@@ -497,12 +507,20 @@ void PipelineCache::InitializeDriverCache() {
+ 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
+ 		return;
+ 	}
++	const std::string_view patch_id = PipelineCachePatchId();
++	std::string            cache_name = title_id;
+ 	if (git_hash.ends_with("-dirty")) {
+-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
+-		return;
++		// V14: a patched (dirty) tree is still reproducible when the kit stamps the cumulative
++		// patch SHA256 into KYTY_PATCH_ID; key the cache file and signature by it.
++		if (patch_id.empty()) {
++			PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build, no KYTY_PATCH_ID)");
++			return;
++		}
++		cache_name += "-" + std::string(patch_id.substr(0, 16));
++		PipelineCacheLog("Vulkan pipeline cache: dirty build keyed by patch id {}", patch_id);
+ 	}
+ 
+-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
++	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (cache_name + ".bin");
+ 	const auto path         = Common::PathToString(m_driver_cache_path);
+ 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
+ 	if (cache_exists) {
+@@ -569,9 +587,31 @@ void PipelineCache::InitializeDriverCache() {
+ }
+ 
+ void PipelineCache::Save() {
++	if (WriteDriverCache()) {
++		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
++		m_driver_cache = nullptr;
++	}
++}
++
++// V14: persist the driver cache periodically so a crash/kill (DeviceLost, closing the window)
++// still keeps already compiled pipelines. Main thread only (pipelines are created there).
++void PipelineCache::NotePipelineCreated() {
+ 	if (m_driver_cache == nullptr) {
+ 		return;
+ 	}
++	m_created_since_save++;
++	const auto now = std::chrono::steady_clock::now();
++	if (m_created_since_save >= 32 && now - m_last_save >= std::chrono::seconds(20)) {
++		WriteDriverCache();
++		m_created_since_save = 0;
++		m_last_save          = now;
++	}
++}
++
++bool PipelineCache::WriteDriverCache() {
++	if (m_driver_cache == nullptr) {
++		return false;
++	}
+ 
+ 	size_t               size = 0;
+ 	vk::Result           result;
+@@ -593,7 +633,7 @@ void PipelineCache::Save() {
+ 	    size > std::numeric_limits<uint32_t>::max()) {
+ 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
+ 		                 vk::to_string(result), size);
+-		return;
++		return false;
+ 	}
+ 	payload.resize(size);
+ 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+@@ -601,7 +641,7 @@ void PipelineCache::Save() {
+ 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+ 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
+ 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+-		return;
++		return false;
+ 	}
+ 	auto temp_path = m_driver_cache_path;
+ 	temp_path += ".tmp";
+@@ -618,12 +658,11 @@ void PipelineCache::Save() {
+ 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
+ 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
+ 		                 Common::PathToString(m_driver_cache_path));
+-		return;
++		return false;
+ 	}
+ 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+ 	                 Common::PathToString(m_driver_cache_path));
+-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+-	m_driver_cache = nullptr;
++	return true;
+ }
+ 
+ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+@@ -930,6 +969,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
+ 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+ 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+ 	                       ps_input_info, programs, static_params, m_driver_cache);
++	NotePipelineCreated();
+ 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+ 
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+@@ -959,6 +999,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
+ 
+ 	auto cached = std::make_unique<Pipeline>();
+ 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
++	NotePipelineCreated();
+ 
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+index 1554d5db..73c89c72 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -1,6 +1,7 @@
+ #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
+ #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
+ 
++#include <chrono>
+ #include "common/abi.h"
+ #include "common/assert.h"
+ #include "common/common.h"
+@@ -173,6 +174,10 @@ private:
+ 	std::unique_ptr<ProgramCache> m_program_cache;
+ 	vk::PipelineCache             m_driver_cache = nullptr;
+ 	std::filesystem::path         m_driver_cache_path;
++	uint32_t                      m_created_since_save = 0;
++	std::chrono::steady_clock::time_point m_last_save = std::chrono::steady_clock::now();
++	void NotePipelineCreated();
++	bool WriteDriverCache();
+ 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
+ 	                                                        m_graphics_pipelines;
+ 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp
+index f0f7d455..7b909fbe 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp
+@@ -4,7 +4,14 @@
+ #include "graphics/shader/shader.h"
+ #include "graphics/shader/shaderBindings.h"
+ 
++#include "common/logging/log.h"
++
++#include <algorithm>
++#include <cinttypes>
++#include <cstdio>
+ #include <cstring>
++#include <utility>
++#include <vector>
+ 
+ namespace Libs::Graphics {
+ 
+@@ -51,6 +58,7 @@ vk::MemoryBarrier MakeShaderWriteDependency() {
+ 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+ 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+ 	                        vk::AccessFlagBits::eVertexAttributeRead |
++	                        vk::AccessFlagBits::eIndirectCommandRead |
+ 	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
+ 	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
+ 	                        vk::AccessFlagBits::eColorAttachmentRead |
+@@ -126,11 +134,185 @@ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+ void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+ 	EXIT_IF(vk_buffer == nullptr || !source_stages);
+ 	const auto barrier = MakeShaderWriteDependency();
++	// V14: also DRAW_INDIRECT so indirect arguments written by graphics shaders are visible.
+ 	vk_buffer.pipelineBarrier(source_stages,
+ 	                          vk::PipelineStageFlagBits::eComputeShader |
++	                              vk::PipelineStageFlagBits::eDrawIndirect |
+ 	                              vk::PipelineStageFlagBits::eAllGraphics |
+ 	                              vk::PipelineStageFlagBits::eTransfer,
+ 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+ }
+ 
++namespace {
++
++struct HazardState {
++	std::vector<std::pair<uint64_t, uint64_t>> ranges; // [begin, end) guest ranges
++	bool        unknown_write  = false;  // graphics BDA write / range overflow: any read conflicts
++	bool        image_write    = false;  // storage image written by a graphics stage
++	uint64_t    producer_hash  = 0;
++	const char* reason         = "";
++	uint64_t    reason_address = 0;
++	uint64_t    barriers       = 0;
++};
++
++HazardState& Hazards() {
++	static HazardState state;
++	return state;
++}
++
++constexpr size_t MaxHazardRanges = 128;
++
++void HazardAddRange(uint64_t begin, uint64_t size) {
++	auto& h = Hazards();
++	if (size == 0 || begin == 0) {
++		return;
++	}
++	const uint64_t end = begin + size;
++	for (auto& r: h.ranges) {
++		if (begin <= r.second && r.first <= end) {
++			r.first  = std::min(r.first, begin);
++			r.second = std::max(r.second, end);
++			return;
++		}
++	}
++	if (h.ranges.size() >= MaxHazardRanges) {
++		h.unknown_write = true; // overflow: be conservative
++		return;
++	}
++	h.ranges.emplace_back(begin, end);
++}
++
++ShaderBufferResource DecodeHazardBuffer(const ShaderRecompiler::IR::DescriptorValue& value) {
++	ShaderBufferResource descriptor;
++	EXIT_IF(value.dword_count < 4);
++	std::memcpy(descriptor.fields, value.dwords.data(), sizeof(descriptor.fields));
++	return descriptor;
++}
++
++} // namespace
++
++void HazardNoteGraphicsStageWrites(const ShaderStageRuntime& runtime, bool include_buffers) {
++	if (!runtime) {
++		return;
++	}
++	const auto& program   = *runtime.program;
++	const auto& resources = *runtime.resources;
++	auto&       h         = Hazards();
++	bool        wrote     = false;
++	for (uint32_t i = 0; include_buffers && i < program.info.buffers.size() &&
++	                     i < resources.buffers.size(); i++) {
++		if (!program.info.buffers[i].written) {
++			continue;
++		}
++		const auto d = DecodeHazardBuffer(resources.buffers[i]);
++		if (d.Base48() != 0 && d.NumRecords() != 0) {
++			HazardAddRange(d.Base48(), d.GetSize());
++			wrote = true;
++		}
++	}
++	for (const auto& image: program.info.images) {
++		if (image.written &&
++		    image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage) {
++			h.image_write = true;
++			wrote         = true;
++		}
++	}
++	if (program.info.bda_writes) {
++		h.unknown_write = true;
++		wrote           = true;
++	}
++	if (wrote) {
++		h.producer_hash = program.shader_hash;
++	}
++}
++
++bool HazardPending() {
++	const auto& h = Hazards();
++	return h.unknown_write || h.image_write || !h.ranges.empty();
++}
++
++bool HazardRangeConflicts(uint64_t address, uint64_t size) {
++	auto& h = Hazards();
++	if (!HazardPending()) {
++		return false;
++	}
++	if (h.unknown_write) {
++		h.reason         = "pending graphics BDA/overflow write";
++		h.reason_address = address;
++		return true;
++	}
++	const uint64_t end = address + (size == 0 ? 1 : size);
++	for (const auto& r: h.ranges) {
++		if (address < r.second && r.first < end) {
++			h.reason         = "range overlap";
++			h.reason_address = address;
++			return true;
++		}
++	}
++	return false;
++}
++
++bool HazardStageConflicts(const ShaderStageRuntime& runtime) {
++	auto& h = Hazards();
++	if (!runtime || !HazardPending()) {
++		return false;
++	}
++	const auto& program   = *runtime.program;
++	const auto& resources = *runtime.resources;
++	if (h.unknown_write) {
++		h.reason         = "pending graphics BDA/overflow write";
++		h.reason_address = 0;
++		return true;
++	}
++	if (program.info.uses_dma) {
++		// BDA readers can touch any guest page.
++		h.reason         = "BDA reader after pending graphics write";
++		h.reason_address = 0;
++		return true;
++	}
++	if (h.image_write && !program.info.images.empty()) {
++		h.reason         = "image reader after graphics storage-image write";
++		h.reason_address = 0;
++		return true;
++	}
++	for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
++		const auto d = DecodeHazardBuffer(resources.buffers[i]);
++		if (d.Base48() != 0 && d.NumRecords() != 0 &&
++		    HazardRangeConflicts(d.Base48(), d.GetSize())) {
++			return true;
++		}
++	}
++	return false;
++}
++
++void HazardReset() {
++	auto& h = Hazards();
++	h.ranges.clear();
++	h.unknown_write = false;
++	h.image_write   = false;
++	h.producer_hash = 0;
++}
++
++void HazardBarrier(vk::CommandBuffer vk_buffer, const char* consumer_kind, uint64_t consumer_hash) {
++	EXIT_IF(vk_buffer == nullptr);
++	auto&             h = Hazards();
++	vk::MemoryBarrier barrier {};
++	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
++	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
++	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
++	                          vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlags {}, 1,
++	                          &barrier, 0, nullptr, 0, nullptr);
++	const auto count = ++h.barriers;
++	if (count <= 64 || (count % 4096) == 0) {
++		std::printf("[V14] hazard barrier #%" PRIu64 ": producer=0x%016" PRIx64
++		            " -> %s consumer=0x%016" PRIx64 " (%s, addr=0x%012" PRIx64 ")\n",
++		            count, h.producer_hash, consumer_kind, consumer_hash, h.reason,
++		            h.reason_address);
++		LOGF("[V14] hazard barrier #%" PRIu64 ": producer=0x%016" PRIx64
++		     " -> %s consumer=0x%016" PRIx64 " (%s, addr=0x%012" PRIx64 ")\n",
++		     count, h.producer_hash, consumer_kind, consumer_hash, h.reason, h.reason_address);
++	}
++	HazardReset();
++}
++
+ } // namespace Libs::Graphics
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h
+index 23eb7590..394c9d37 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h
++++ b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h
+@@ -20,6 +20,20 @@ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+                               vk::PipelineStageFlags destination_stages);
+ void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+ 
++// V14 hazard tracker (KYTY_SYNC_COMPUTE=3/4, GPU thread only). Producers are writes that are NOT
++// covered by the per-dispatch COMPUTE_SHADER -> ALL_COMMANDS barrier: graphics-stage storage
++// buffer/image writes and graphics BDA writes.
++// include_buffers=false when the caller already emitted ShaderWriteBarrier for buffer writes.
++void HazardNoteGraphicsStageWrites(const ShaderStageRuntime& runtime, bool include_buffers);
++// True when the consumer must be ordered after pending writes (records the reason).
++bool HazardStageConflicts(const ShaderStageRuntime& runtime);
++bool HazardRangeConflicts(uint64_t address, uint64_t size);
++bool HazardPending();
++// Emits a global ALL_COMMANDS memory barrier, logs the producer/consumer pair, clears the state.
++void HazardBarrier(vk::CommandBuffer vk_buffer, const char* consumer_kind, uint64_t consumer_hash);
++// Called whenever some other path emitted a global barrier.
++void HazardReset();
++
+ } // namespace Libs::Graphics
+ 
+ #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_SHADERRESOURCEBARRIER_H_
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index eb9d97b4..02b0ef61 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -15,6 +15,7 @@
+ #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+ #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
++#include "graphics/host_gpu/renderer/debugSync.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+@@ -367,6 +368,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
+ 	                }) ||
+ 	    has_storage_writes;
++	if (DebugSyncHazardTracking() && HazardStageConflicts(input_info.stage)) {
++		// V14: order this dispatch after pending graphics-stage writes it may read.
++		HazardBarrier(vk_buffer, "dispatch", program.shader_hash);
++	}
+ 	if (has_storage_writes) {
+ 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
+ 		// while allowing the queue to execute asynchronously.
+@@ -520,6 +525,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+ 		    return image.written && image.resource_class ==
+ 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
+ 	    });
++	if (DebugSyncHazardTracking() &&
++	    (HazardStageConflicts(input_info.stage) ||
++	     HazardRangeConflicts(args_addr, sizeof(vk::DispatchIndirectCommand)))) {
++		// V14: indirect arguments / inputs written by a graphics stage.
++		HazardBarrier(vk_buffer, "dispatch-indirect", program.shader_hash);
++	}
+ 	if (has_storage_writes) {
+ 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+ 	}
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index 84d8c813..8ec70cc4 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -19,6 +19,7 @@
+ #include "graphics/host_gpu/renderer/image/textureCommon.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+ #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
++#include "graphics/host_gpu/renderer/debugSync.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+@@ -1115,6 +1116,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 	// point onward, every operation targets the current command buffer and cannot touch guest
+ 	// memory.
+ 	auto vk_buffer = buffer.Handle();
++	if (DebugSyncHazardTracking() && HazardPending()) {
++		// V14: order this draw after pending graphics-stage storage-image/BDA writes it may read.
++		bool     conflict      = false;
++		uint64_t consumer_hash = 0;
++		for (const auto& stage: vertex_stages) {
++			if (!conflict && HazardStageConflicts(stage.stage)) {
++				conflict      = true;
++				consumer_hash = stage.stage.program->shader_hash;
++			}
++		}
++		if (!conflict && state.ps_active && HazardStageConflicts(state.ps_input_info.stage)) {
++			conflict      = true;
++			consumer_hash = state.ps_input_info.stage.program->shader_hash;
++		}
++		if (conflict) {
++			m_context.GetCommandScheduler().EndRendering();
++			HazardBarrier(vk_buffer, "draw", consumer_hash);
++		}
++	}
+ 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+ 	if (!mesh_active) {
+ 		CommitVertexBuffers(vk_buffer, vertex_bindings);
+@@ -1175,6 +1195,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 		m_context.GetCommandScheduler().EndRendering();
+ 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+ 	}
++	if (DebugSyncHazardTracking()) {
++		// V14: storage-image and BDA writes from graphics stages are not covered by the
++		// buffer-only ShaderWriteBarrier above; remember them for the next reader.
++		for (const auto& stage: vertex_stages) {
++			HazardNoteGraphicsStageWrites(stage.stage, false);
++		}
++		if (state.ps_active) {
++			HazardNoteGraphicsStageWrites(state.ps_input_info.stage, false);
++		}
++	}
+ 	LogDrawPhase(draw.Name(), "DrawComplete");
+ 	if (!draw.IsIndexed()) {
+ 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
+diff --git a/src/graphics/presentation/window/vulkanWindow.cpp b/src/graphics/presentation/window/vulkanWindow.cpp
+index 2a31df04..51795103 100644
+--- a/src/graphics/presentation/window/vulkanWindow.cpp
++++ b/src/graphics/presentation/window/vulkanWindow.cpp
+@@ -1,6 +1,7 @@
+ #include <SDL3/SDL.h>
+ #include <SDL3/SDL_vulkan.h>
+ 
++#include "graphics/host_gpu/renderer/debugSync.h"
+ #include "common/assert.h"
+ #include "common/common.h"
+ #include "common/emulatorConfig.h"
+@@ -1071,14 +1072,21 @@ void WindowContext::CreateVulkan() {
+ 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+ 			graphic_ctx.memory_budget_ext_enabled = true;
+ 		}
+-		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
++		// V14: NV checkpoints + NV diagnostics config cost GPU time on every dispatch; they are
++		// now opt-in (KYTY_NV_DIAGNOSTICS=1). VK_EXT_device_fault stays on (queried only after loss).
++		const bool nv_diagnostics = DebugSyncEnvInt("KYTY_NV_DIAGNOSTICS", 0) != 0;
++		std::printf("GPU: V14 NV diagnostics (checkpoints + diagnostics config): %s (KYTY_NV_DIAGNOSTICS)\n",
++		            nv_diagnostics ? "on" : "off");
++		if (nv_diagnostics &&
++		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+ 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+ 			graphic_ctx.diagnostic_checkpoints_enabled = true;
+ 		}
+ 		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+ 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+ 		}
+-		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
++		if (nv_diagnostics &&
++		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+ 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+ 		}
+ 		if (HasExtension(available_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME) &&
